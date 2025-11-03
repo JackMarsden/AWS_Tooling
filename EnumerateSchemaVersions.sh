@@ -1,156 +1,237 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -euo pipefail
 
-# ============================
-#  Colors
-# ============================
-RED="\033[0;31m"
-GREEN="\033[0;32m"
-YELLOW="\033[1;33m"
-NC="\033[0m" # No Color
+# ========================
+# AWS_Tooling: EnumerateSchemaVersions.sh
+# Audits AWS policy schema versions across multiple services
+# ========================
 
-# ============================
-#  Parse arguments
-# ============================
+# Default values
 PROFILE="default"
+VERBOSE=false
 LATEST_SCHEMA_VERSION=""
-ARGS_PROVIDED=0
 
-while [[ $# -gt 0 ]]; do
-  ARGS_PROVIDED=1
-  case $1 in
-    --profile)
-      PROFILE="$2"
-      shift 2
-      ;;
-    --latestSchemaVersion)
-      LATEST_SCHEMA_VERSION="$2"
-      shift 2
-      ;;
-    *)
-      echo -e "${RED}❌ Unknown option: $1${NC}"
-      echo "Usage: $0 --latestSchemaVersion <version> [--profile <aws_profile_name>]"
-      exit 1
-      ;;
-  esac
-done
+# Colors for terminal output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
 
-# ============================
-#  Check mandatory flag
-# ============================
-if [[ -z "$LATEST_SCHEMA_VERSION" ]]; then
-  echo -e "${RED}⚠️  Mandatory flag --latestSchemaVersion not provided!${NC}"
-  echo "Please provide the latest policy schema version in the format: --latestSchemaVersion \"2012-10-17\""
-  echo "Optionally, you can use --profile <profile_name> to specify an AWS CLI profile."
-  echo "AWS IAM policy versions documentation: https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_elements_version.html"
-  exit 1
-fi
-
-# ============================
-#  AWS Auth Check
-# ============================
-if ! aws sts get-caller-identity --profile "$PROFILE" &>/dev/null; then
-  echo -e "${RED}❌ AWS CLI cannot authenticate using profile '$PROFILE'. Please check your credentials.${NC}"
-  exit 1
-fi
-
-echo -e "${GREEN}✅ AWS authentication check successful for profile '$PROFILE'.${NC}"
-
-# ============================
-#  Setup output
-# ============================
-TS=$(date +"%Y%m%d_%H%M%S")
-OUTPUT="aws_policy_schema_audit_${TS}.csv"
-
-echo "🔍 Using AWS profile: [$PROFILE]"
-echo "📄 Output file: $OUTPUT"
-echo "📌 Latest schema version to check against: $LATEST_SCHEMA_VERSION"
-echo "Service,Resource,PolicyNameOrID,PolicyVersion,Status" > "$OUTPUT"
-
-# ============================
-#  Helper function
-# ============================
-check_version() {
-  local service="$1"
-  local resource="$2"
-  local name="$3"
-  local policy_json="$4"
-
-  version=$(echo "$policy_json" | jq -r '.Version // empty')
-  if [[ -z "$version" ]]; then
-    version="(none)"
-    status="❌ Missing Version"
-    echo -e "${RED}[${service}] ${resource} - Policy version missing!${NC}"
-  elif [[ "$version" == "$LATEST_SCHEMA_VERSION" ]]; then
-    status="✅ Current"
-  else
-    status="⚠️ Outdated ($version)"
-    echo -e "${YELLOW}[${service}] ${resource} - Outdated policy version: $version (Expected: $LATEST_SCHEMA_VERSION)${NC}"
-  fi
-
-  echo "$service,$resource,$name,$version,$status" >> "$OUTPUT"
+# Usage
+usage() {
+    echo "Usage: $0 --latestSchemaVersion <version> [--profile <aws_profile>] [--v]"
+    echo "  --latestSchemaVersion   Mandatory, e.g., '2012-10-17'"
+    echo "  --profile               Optional, AWS CLI profile to use (default='default')"
+    echo "  --v                      Optional, verbose output"
 }
 
-# ============================
-#  Start enumeration (services)
-# ============================
-echo "🚀 Starting AWS Policy Schema Audit..."
-echo
-
-# --- IAM Policies ---
-echo "→ Checking IAM policies..."
-for arn in $(aws iam list-policies --scope All --query "Policies[].Arn" --output text --profile "$PROFILE"); do
-  name=$(basename "$arn")
-  verid=$(aws iam get-policy --policy-arn "$arn" --query "Policy.DefaultVersionId" --output text --profile "$PROFILE")
-  doc=$(aws iam get-policy-version --policy-arn "$arn" --version-id "$verid" --query "PolicyVersion.Document" --output json --profile "$PROFILE" 2>/dev/null || echo "{}")
-  check_version "IAM" "$arn" "$name" "$doc"
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --latestSchemaVersion)
+            LATEST_SCHEMA_VERSION="$2"
+            shift 2
+            ;;
+        --profile)
+            PROFILE="$2"
+            shift 2
+            ;;
+        --v)
+            VERBOSE=true
+            shift
+            ;;
+        *)
+            usage
+            exit 1
+            ;;
+    esac
 done
 
-# --- S3 Bucket Policies ---
-echo "→ Checking S3 bucket policies..."
-for bucket in $(aws s3api list-buckets --query "Buckets[].Name" --output text --profile "$PROFILE"); do
-  policy=$(aws s3api get-bucket-policy --bucket "$bucket" --query "Policy" --output text --profile "$PROFILE" 2>/dev/null || echo "{}")
-  [[ "$policy" != "{}" ]] && check_version "S3" "$bucket" "$bucket" "$policy"
-done
+# Mandatory check
+if [[ -z "$LATEST_SCHEMA_VERSION" ]]; then
+    echo -e "${RED}Error: --latestSchemaVersion is mandatory.${NC}"
+    echo "See https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_elements_version.html for details."
+    usage
+    exit 1
+fi
 
-# --- SNS Topic Policies ---
-echo "→ Checking SNS topic policies..."
-for topic_arn in $(aws sns list-topics --query "Topics[].TopicArn" --output text --profile "$PROFILE"); do
-  policy=$(aws sns get-topic-attributes --topic-arn "$topic_arn" --query "Attributes.Policy" --output text --profile "$PROFILE" 2>/dev/null || echo "{}")
-  [[ "$policy" != "{}" ]] && check_version "SNS" "$topic_arn" "$topic_arn" "$policy"
-done
+# Pre-flight AWS credentials check
+if ! aws sts get-caller-identity --profile "$PROFILE" &>/dev/null; then
+    echo -e "${RED}Error: Cannot authenticate with AWS using profile '$PROFILE'.${NC}"
+    exit 1
+fi
 
-# --- SQS Queue Policies ---
-echo "→ Checking SQS queue policies..."
-for queue_url in $(aws sqs list-queues --query "QueueUrls[]" --output text --profile "$PROFILE" 2>/dev/null); do
-  policy=$(aws sqs get-queue-attributes --queue-url "$queue_url" --attribute-names Policy --query "Attributes.Policy" --output text --profile "$PROFILE" 2>/dev/null || echo "{}")
-  [[ "$policy" != "{}" ]] && check_version "SQS" "$queue_url" "$queue_url" "$policy"
-done
+if [[ "$VERBOSE" = true ]]; then
+    echo -e "${GREEN}AWS credentials verified for profile '$PROFILE'.${NC}"
+fi
 
-# --- Lambda Function Policies ---
-echo "→ Checking Lambda function policies..."
-for fn in $(aws lambda list-functions --query "Functions[].FunctionName" --output text --profile "$PROFILE" 2>/dev/null); do
-  policy=$(aws lambda get-policy --function-name "$fn" --output text --profile "$PROFILE" 2>/dev/null || echo "{}")
-  [[ "$policy" != "{}" ]] && check_version "Lambda" "$fn" "$fn" "$policy"
-done
+# Output file
+OUTPUT_FILE="aws_policy_schema_audit_$(date +%Y%m%d_%H%M%S).csv"
+echo "Service,Resource,PolicyNameOrID,PolicyVersion,Status" > "$OUTPUT_FILE"
 
-# --- KMS Key Policies ---
-echo "→ Checking KMS key policies..."
-for keyid in $(aws kms list-keys --query "Keys[].KeyId" --output text --profile "$PROFILE" 2>/dev/null); do
-  policy=$(aws kms get-key-policy --key-id "$keyid" --policy-name default --output text --profile "$PROFILE" 2>/dev/null || echo "{}")
-  [[ "$policy" != "{}" ]] && check_version "KMS" "$keyid "$keyid" "$policy"
-done
+# Generic audit function
+audit_policy() {
+    local service=$1
+    local resource=$2
+    local policy_json=$3
 
-# --- Secrets Manager Policies ---
-echo "→ Checking Secrets Manager resource policies..."
-for secret_arn in $(aws secretsmanager list-secrets --query "SecretList[].ARN" --output text --profile "$PROFILE" 2>/dev/null); do
-  policy=$(aws secretsmanager get-resource-policy --secret-id "$secret_arn" --query "ResourcePolicy" --output text --profile "$PROFILE" 2>/dev/null || echo "{}")
-  [[ "$policy" != "{}" ]] && check_version "SecretsManager" "$secret_arn" "$secret_arn" "$policy"
-done
+    VERSION=$(echo "$policy_json" | jq -r '.Version // empty')
+    STATUS="Compliant"
+    if [[ "$VERSION" != "$LATEST_SCHEMA_VERSION" ]]; then
+        STATUS="Outdated"
+        echo -e "${YELLOW}[!] $service Policy: $resource uses version $VERSION, expected $LATEST_SCHEMA_VERSION${NC}"
+    elif [[ "$VERBOSE" = true ]]; then
+        echo -e "${GREEN}[✓] $service Policy: $resource is compliant.${NC}"
+    fi
+    echo "$service,$resource,N/A,$VERSION,$STATUS" >> "$OUTPUT_FILE"
+}
 
-# ============================
-#  Finish
-# ============================
-echo
-echo -e "${GREEN}✅ Policy schema audit complete!${NC}"
-echo "📊 Results saved to: $OUTPUT"
+# =======================
+# Audit functions for each service
+# =======================
+
+# IAM
+audit_iam_policies() {
+    echo "Auditing IAM policies..."
+    POLICIES=$(aws iam list-policies --scope Local --profile "$PROFILE" | jq -r '.Policies[] | @base64')
+    for p in $POLICIES; do
+        POLICY=$(echo "$p" | base64 --decode)
+        NAME=$(echo "$POLICY" | jq -r '.PolicyName')
+        ARN=$(echo "$POLICY" | jq -r '.Arn')
+        DEFAULT_VERSION_ID=$(echo "$POLICY" | jq -r '.DefaultVersionId')
+        VERSION_JSON=$(aws iam get-policy-version --policy-arn "$ARN" --version-id "$DEFAULT_VERSION_ID" --profile "$PROFILE" | jq -r '.PolicyVersion.Document')
+        audit_policy "IAM" "$ARN ($NAME)" "$VERSION_JSON"
+    done
+}
+
+# S3
+audit_s3_policies() {
+    echo "Auditing S3 bucket policies..."
+    BUCKETS=$(aws s3api list-buckets --profile "$PROFILE" | jq -r '.Buckets[].Name')
+    for b in $BUCKETS; do
+        if POLICY_JSON=$(aws s3api get-bucket-policy --bucket "$b" --profile "$PROFILE" 2>/dev/null | jq -r '.Policy'); then
+            audit_policy "S3" "$b" "$POLICY_JSON"
+        fi
+    done
+}
+
+# SNS
+audit_sns_policies() {
+    echo "Auditing SNS topic policies..."
+    TOPICS=$(aws sns list-topics --profile "$PROFILE" | jq -r '.Topics[].TopicArn')
+    for t in $TOPICS; do
+        if POLICY_JSON=$(aws sns get-topic-attributes --topic-arn "$t" --profile "$PROFILE" | jq -r '.Attributes.Policy // empty'); then
+            audit_policy "SNS" "$t" "$POLICY_JSON"
+        fi
+    done
+}
+
+# SQS
+audit_sqs_policies() {
+    echo "Auditing SQS queue policies..."
+    QUEUES=$(aws sqs list-queues --profile "$PROFILE" | jq -r '.QueueUrls[]')
+    for q in $QUEUES; do
+        if POLICY_JSON=$(aws sqs get-queue-attributes --queue-url "$q" --attribute-names Policy --profile "$PROFILE" | jq -r '.Attributes.Policy // empty'); then
+            audit_policy "SQS" "$q" "$POLICY_JSON"
+        fi
+    done
+}
+
+# Lambda
+audit_lambda_policies() {
+    echo "Auditing Lambda function policies..."
+    FUNCTIONS=$(aws lambda list-functions --profile "$PROFILE" | jq -r '.Functions[].FunctionName')
+    for f in $FUNCTIONS; do
+        if POLICY_JSON=$(aws lambda get-policy --function-name "$f" --profile "$PROFILE" 2>/dev/null | jq -r '.'); then
+            audit_policy "Lambda" "$f" "$POLICY_JSON"
+        fi
+    done
+}
+
+# KMS
+audit_kms_policies() {
+    echo "Auditing KMS key policies..."
+    KEYS=$(aws kms list-keys --profile "$PROFILE" | jq -r '.Keys[].KeyId')
+    for k in $KEYS; do
+        POLICY_JSON=$(aws kms get-key-policy --key-id "$k" --policy-name default --profile "$PROFILE" 2>/dev/null)
+        if [[ -n "$POLICY_JSON" ]]; then
+            audit_policy "KMS" "$k" "$POLICY_JSON"
+        fi
+    done
+}
+
+# Secrets Manager
+audit_secrets_policies() {
+    echo "Auditing Secrets Manager policies..."
+    SECRETS=$(aws secretsmanager list-secrets --profile "$PROFILE" | jq -r '.SecretList[].ARN')
+    for s in $SECRETS; do
+        POLICY_JSON=$(aws secretsmanager get-resource-policy --secret-id "$s" --profile "$PROFILE" 2>/dev/null | jq -r '.ResourcePolicy // empty')
+        if [[ -n "$POLICY_JSON" ]]; then
+            audit_policy "SecretsManager" "$s" "$POLICY_JSON"
+        fi
+    done
+}
+
+# EventBridge
+audit_eventbridge_policies() {
+    echo "Auditing EventBridge bus policies..."
+    BUSES=$(aws events list-event-buses --profile "$PROFILE" | jq -r '.EventBuses[].Name')
+    for b in $BUSES; do
+        POLICY_JSON=$(aws events describe-event-bus --name "$b" --profile "$PROFILE" | jq -r '.Policy // empty')
+        if [[ -n "$POLICY_JSON" ]]; then
+            audit_policy "EventBridge" "$b" "$POLICY_JSON"
+        fi
+    done
+}
+
+# API Gateway
+audit_apigateway_policies() {
+    echo "Auditing API Gateway policies..."
+    APIS=$(aws apigateway get-rest-apis --profile "$PROFILE" | jq -r '.items[].id')
+    for api in $APIS; do
+        POLICY_JSON=$(aws apigateway get-rest-api --rest-api-id "$api" --profile "$PROFILE" | jq -r '.policy // empty')
+        if [[ -n "$POLICY_JSON" ]]; then
+            audit_policy "APIGateway" "$api" "$POLICY_JSON"
+        fi
+    done
+}
+
+# CloudWatch Logs
+audit_cwlogs_policies() {
+    echo "Auditing CloudWatch Logs resource policies..."
+    POLICIES=$(aws logs describe-resource-policies --profile "$PROFILE" | jq -r '.resourcePolicies[].policyDocument // empty')
+    for p in $POLICIES; do
+        NAME=$(echo "$p" | jq -r '.Id // "Unknown"')
+        audit_policy "CloudWatchLogs" "$NAME" "$p"
+    done
+}
+
+# Step Functions
+audit_sfn_policies() {
+    echo "Auditing Step Functions state machine policies..."
+    SFNS=$(aws stepfunctions list-state-machines --profile "$PROFILE" | jq -r '.stateMachines[].stateMachineArn')
+    for sfn in $SFNS; do
+        POLICY_JSON=$(aws stepfunctions describe-state-machine --state-machine-arn "$sfn" --profile "$PROFILE" | jq -r '.roleArn' | xargs -I{} aws iam get-role --role-name {} --profile "$PROFILE" | jq -r '.Role.AssumeRolePolicyDocument // empty')
+        if [[ -n "$POLICY_JSON" ]]; then
+            audit_policy "StepFunctions" "$sfn" "$POLICY_JSON"
+        fi
+    done
+}
+
+# =======================
+# Main execution
+# =======================
+
+audit_iam_policies
+audit_s3_policies
+audit_sns_policies
+audit_sqs_policies
+audit_lambda_policies
+audit_kms_policies
+audit_secrets_policies
+audit_eventbridge_policies
+audit_apigateway_policies
+audit_cwlogs_policies
+audit_sfn_policies
+
+echo -e "${GREEN}Audit complete. Results saved to $OUTPUT_FILE${NC}"
