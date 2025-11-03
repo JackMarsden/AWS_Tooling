@@ -4,6 +4,7 @@ set -euo pipefail
 # ========================
 # AWS_Tooling: EnumerateSchemaVersions.sh
 # Audits AWS policy schema versions across multiple services
+# Handles resources without policies safely
 # ========================
 
 # Default values
@@ -75,16 +76,27 @@ audit_policy() {
     local resource=$2
     local policy_json=$3
 
+    if [[ -z "$policy_json" ]]; then
+        STATUS="No Policy"
+        # Keep "No Policy" yellow/orange
+        echo -e "${YELLOW}[!] $service: $resource has no policy.${NC}"
+        echo "$service,$resource,N/A,N/A,$STATUS" >> "$OUTPUT_FILE"
+        return
+    fi
+
     VERSION=$(echo "$policy_json" | jq -r '.Version // empty')
     STATUS="Compliant"
     if [[ "$VERSION" != "$LATEST_SCHEMA_VERSION" ]]; then
         STATUS="Outdated"
-        echo -e "${YELLOW}[!] $service Policy: $resource uses version $VERSION, expected $LATEST_SCHEMA_VERSION${NC}"
+        # Non-compliant is now red
+        echo -e "${RED}[!] $service Policy: $resource uses version $VERSION, expected $LATEST_SCHEMA_VERSION${NC}"
     elif [[ "$VERBOSE" = true ]]; then
+        # Compliant stays green
         echo -e "${GREEN}[✓] $service Policy: $resource is compliant.${NC}"
     fi
     echo "$service,$resource,N/A,$VERSION,$STATUS" >> "$OUTPUT_FILE"
 }
+
 
 # =======================
 # Audit functions for each service
@@ -109,9 +121,11 @@ audit_s3_policies() {
     echo "Auditing S3 bucket policies..."
     BUCKETS=$(aws s3api list-buckets --profile "$PROFILE" | jq -r '.Buckets[].Name')
     for b in $BUCKETS; do
-        if POLICY_JSON=$(aws s3api get-bucket-policy --bucket "$b" --profile "$PROFILE" 2>/dev/null | jq -r '.Policy'); then
-            audit_policy "S3" "$b" "$POLICY_JSON"
+        POLICY_JSON=""
+        if POLICY_RAW=$(aws s3api get-bucket-policy --bucket "$b" --profile "$PROFILE" 2>/dev/null); then
+            POLICY_JSON=$(echo "$POLICY_RAW" | jq -r '.Policy // empty')
         fi
+        audit_policy "S3" "$b" "$POLICY_JSON"
     done
 }
 
@@ -120,20 +134,24 @@ audit_sns_policies() {
     echo "Auditing SNS topic policies..."
     TOPICS=$(aws sns list-topics --profile "$PROFILE" | jq -r '.Topics[].TopicArn')
     for t in $TOPICS; do
-        if POLICY_JSON=$(aws sns get-topic-attributes --topic-arn "$t" --profile "$PROFILE" | jq -r '.Attributes.Policy // empty'); then
-            audit_policy "SNS" "$t" "$POLICY_JSON"
+        POLICY_JSON=""
+        if POLICY_RAW=$(aws sns get-topic-attributes --topic-arn "$t" --profile "$PROFILE"); then
+            POLICY_JSON=$(echo "$POLICY_RAW" | jq -r '.Attributes.Policy // empty')
         fi
+        audit_policy "SNS" "$t" "$POLICY_JSON"
     done
 }
 
 # SQS
 audit_sqs_policies() {
     echo "Auditing SQS queue policies..."
-    QUEUES=$(aws sqs list-queues --profile "$PROFILE" | jq -r '.QueueUrls[]')
+    QUEUES=$(aws sqs list-queues --profile "$PROFILE" | jq -r '.QueueUrls[]?')
     for q in $QUEUES; do
-        if POLICY_JSON=$(aws sqs get-queue-attributes --queue-url "$q" --attribute-names Policy --profile "$PROFILE" | jq -r '.Attributes.Policy // empty'); then
-            audit_policy "SQS" "$q" "$POLICY_JSON"
+        POLICY_JSON=""
+        if POLICY_RAW=$(aws sqs get-queue-attributes --queue-url "$q" --attribute-names Policy --profile "$PROFILE"); then
+            POLICY_JSON=$(echo "$POLICY_RAW" | jq -r '.Attributes.Policy // empty')
         fi
+        audit_policy "SQS" "$q" "$POLICY_JSON"
     done
 }
 
@@ -142,9 +160,11 @@ audit_lambda_policies() {
     echo "Auditing Lambda function policies..."
     FUNCTIONS=$(aws lambda list-functions --profile "$PROFILE" | jq -r '.Functions[].FunctionName')
     for f in $FUNCTIONS; do
-        if POLICY_JSON=$(aws lambda get-policy --function-name "$f" --profile "$PROFILE" 2>/dev/null | jq -r '.'); then
-            audit_policy "Lambda" "$f" "$POLICY_JSON"
+        POLICY_JSON=""
+        if POLICY_RAW=$(aws lambda get-policy --function-name "$f" --profile "$PROFILE" 2>/dev/null); then
+            POLICY_JSON="$POLICY_RAW"
         fi
+        audit_policy "Lambda" "$f" "$POLICY_JSON"
     done
 }
 
@@ -153,10 +173,11 @@ audit_kms_policies() {
     echo "Auditing KMS key policies..."
     KEYS=$(aws kms list-keys --profile "$PROFILE" | jq -r '.Keys[].KeyId')
     for k in $KEYS; do
-        POLICY_JSON=$(aws kms get-key-policy --key-id "$k" --policy-name default --profile "$PROFILE" 2>/dev/null)
-        if [[ -n "$POLICY_JSON" ]]; then
-            audit_policy "KMS" "$k" "$POLICY_JSON"
+        POLICY_JSON=""
+        if POLICY_RAW=$(aws kms get-key-policy --key-id "$k" --policy-name default --profile "$PROFILE" 2>/dev/null); then
+            POLICY_JSON="$POLICY_RAW"
         fi
+        audit_policy "KMS" "$k" "$POLICY_JSON"
     done
 }
 
@@ -165,10 +186,11 @@ audit_secrets_policies() {
     echo "Auditing Secrets Manager policies..."
     SECRETS=$(aws secretsmanager list-secrets --profile "$PROFILE" | jq -r '.SecretList[].ARN')
     for s in $SECRETS; do
-        POLICY_JSON=$(aws secretsmanager get-resource-policy --secret-id "$s" --profile "$PROFILE" 2>/dev/null | jq -r '.ResourcePolicy // empty')
-        if [[ -n "$POLICY_JSON" ]]; then
-            audit_policy "SecretsManager" "$s" "$POLICY_JSON"
+        POLICY_JSON=""
+        if POLICY_RAW=$(aws secretsmanager get-resource-policy --secret-id "$s" --profile "$PROFILE" 2>/dev/null); then
+            POLICY_JSON=$(echo "$POLICY_RAW" | jq -r '.ResourcePolicy // empty')
         fi
+        audit_policy "SecretsManager" "$s" "$POLICY_JSON"
     done
 }
 
@@ -177,10 +199,11 @@ audit_eventbridge_policies() {
     echo "Auditing EventBridge bus policies..."
     BUSES=$(aws events list-event-buses --profile "$PROFILE" | jq -r '.EventBuses[].Name')
     for b in $BUSES; do
-        POLICY_JSON=$(aws events describe-event-bus --name "$b" --profile "$PROFILE" | jq -r '.Policy // empty')
-        if [[ -n "$POLICY_JSON" ]]; then
-            audit_policy "EventBridge" "$b" "$POLICY_JSON"
+        POLICY_JSON=""
+        if POLICY_RAW=$(aws events describe-event-bus --name "$b" --profile "$PROFILE"); then
+            POLICY_JSON=$(echo "$POLICY_RAW" | jq -r '.Policy // empty')
         fi
+        audit_policy "EventBridge" "$b" "$POLICY_JSON"
     done
 }
 
@@ -189,20 +212,23 @@ audit_apigateway_policies() {
     echo "Auditing API Gateway policies..."
     APIS=$(aws apigateway get-rest-apis --profile "$PROFILE" | jq -r '.items[].id')
     for api in $APIS; do
-        POLICY_JSON=$(aws apigateway get-rest-api --rest-api-id "$api" --profile "$PROFILE" | jq -r '.policy // empty')
-        if [[ -n "$POLICY_JSON" ]]; then
-            audit_policy "APIGateway" "$api" "$POLICY_JSON"
+        POLICY_JSON=""
+        if POLICY_RAW=$(aws apigateway get-rest-api --rest-api-id "$api" --profile "$PROFILE"); then
+            POLICY_JSON=$(echo "$POLICY_RAW" | jq -r '.policy // empty')
         fi
+        audit_policy "APIGateway" "$api" "$POLICY_JSON"
     done
 }
 
 # CloudWatch Logs
 audit_cwlogs_policies() {
     echo "Auditing CloudWatch Logs resource policies..."
-    POLICIES=$(aws logs describe-resource-policies --profile "$PROFILE" | jq -r '.resourcePolicies[].policyDocument // empty')
+    POLICIES=$(aws logs describe-resource-policies --profile "$PROFILE" | jq -r '.resourcePolicies[]? | @base64')
     for p in $POLICIES; do
-        NAME=$(echo "$p" | jq -r '.Id // "Unknown"')
-        audit_policy "CloudWatchLogs" "$NAME" "$p"
+        POLICY=$(echo "$p" | base64 --decode)
+        NAME=$(echo "$POLICY" | jq -r '.policyName // "Unknown"')
+        POLICY_JSON=$(echo "$POLICY" | jq -c '.policyDocument // empty')
+        audit_policy "CloudWatchLogs" "$NAME" "$POLICY_JSON"
     done
 }
 
@@ -211,10 +237,15 @@ audit_sfn_policies() {
     echo "Auditing Step Functions state machine policies..."
     SFNS=$(aws stepfunctions list-state-machines --profile "$PROFILE" | jq -r '.stateMachines[].stateMachineArn')
     for sfn in $SFNS; do
-        POLICY_JSON=$(aws stepfunctions describe-state-machine --state-machine-arn "$sfn" --profile "$PROFILE" | jq -r '.roleArn' | xargs -I{} aws iam get-role --role-name {} --profile "$PROFILE" | jq -r '.Role.AssumeRolePolicyDocument // empty')
-        if [[ -n "$POLICY_JSON" ]]; then
-            audit_policy "StepFunctions" "$sfn" "$POLICY_JSON"
+        POLICY_JSON=""
+        ROLE_ARN=$(aws stepfunctions describe-state-machine --state-machine-arn "$sfn" --profile "$PROFILE" | jq -r '.roleArn // empty')
+        if [[ -n "$ROLE_ARN" ]]; then
+            ROLE_NAME=$(echo "$ROLE_ARN" | awk -F/ '{print $NF}')
+            if ROLE_POLICY_RAW=$(aws iam get-role --role-name "$ROLE_NAME" --profile "$PROFILE" 2>/dev/null); then
+                POLICY_JSON=$(echo "$ROLE_POLICY_RAW" | jq -r '.Role.AssumeRolePolicyDocument // empty')
+            fi
         fi
+        audit_policy "StepFunctions" "$sfn" "$POLICY_JSON"
     done
 }
 
