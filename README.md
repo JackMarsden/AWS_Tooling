@@ -63,10 +63,14 @@ chmod +x EnumerateSchemaVersions.sh
 ### Examples
 
 # Using default AWS CLI profile
+```bash
 ./EnumerateSchemaVersions.sh --latestSchemaVersion "2012-10-17"
+```
 
 # Using a specific profile
+```bash
 ./EnumerateSchemaVersions.sh --latestSchemaVersion "2012-10-17" --profile MyAccount
+```
 
 ---
 
