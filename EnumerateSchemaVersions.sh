@@ -23,7 +23,7 @@ usage() {
     echo "Usage: $0 --latestSchemaVersion <version> [--profile <aws_profile>] [--v]"
     echo "  --latestSchemaVersion   Mandatory, e.g., '2012-10-17'"
     echo "  --profile               Optional, AWS CLI profile to use (default='default')"
-    echo "  --v                      Optional, verbose output"
+    echo "  --v                     Optional, verbose output"
 }
 
 # Parse arguments
@@ -73,28 +73,48 @@ audit_policy() {
     local resource=$2
     local policy_json=$3
 
-    if [[ -z "$policy_json" || "$policy_json" == "null" ]]; then
+    if [[ -z "$policy_json" ]]; then
         STATUS="No Policy"
-        [[ "$VERBOSE" = true ]] && echo -e "${YELLOW}[!] $service: $resource has no policy.${NC}"
+        echo -e "${YELLOW}[!] $service: $resource has no policy.${NC}"
         echo "$service,$resource,N/A,N/A,$STATUS" >> "$OUTPUT_FILE"
         return
     fi
 
-    VERSION=$(echo "$policy_json" | jq -r '.Version // empty')
-    if [[ -z "$VERSION" ]]; then
-        STATUS="No Policy"
-        [[ "$VERBOSE" = true ]] && echo -e "${YELLOW}[!] $service: $resource has no policy version.${NC}"
-        echo "$service,$resource,N/A,N/A,$STATUS" >> "$OUTPUT_FILE"
-        return
+    local VERSION=""
+    local USE_VERSION_CHECK=false
+
+    case $service in
+        IAM|S3|SNS|SQS|SecretsManager)
+            USE_VERSION_CHECK=true
+            ;;
+    esac
+
+    if $USE_VERSION_CHECK; then
+        # Parse version if applicable
+        if echo "$policy_json" | jq -e . &>/dev/null; then
+            VERSION=$(echo "$policy_json" | jq -r '.Version // empty')
+        else
+            VERSION=$(echo "$policy_json" | jq -r 'fromjson.Version // empty' 2>/dev/null || "")
+        fi
     fi
 
-    if [[ "$VERSION" != "$LATEST_SCHEMA_VERSION" ]]; then
-        STATUS="Outdated"
-        echo -e "${RED}[!] $service Policy: $resource uses version $VERSION, expected $LATEST_SCHEMA_VERSION${NC}"
+    if $USE_VERSION_CHECK; then
+        if [[ -z "$VERSION" ]]; then
+            STATUS="Non-Compliant"
+            echo -e "${RED}[!] $service: $resource has no valid Version.${NC}"
+        elif [[ "$VERSION" != "$LATEST_SCHEMA_VERSION" ]]; then
+            STATUS="Outdated"
+            echo -e "${RED}[!] $service Policy: $resource uses version $VERSION, expected $LATEST_SCHEMA_VERSION${NC}"
+        else
+            STATUS="Compliant"
+            [[ "$VERBOSE" = true ]] && echo -e "${GREEN}[✓] $service Policy: $resource is compliant.${NC}"
+        fi
     else
+        # For non-versioned policies, just check existence
         STATUS="Compliant"
         [[ "$VERBOSE" = true ]] && echo -e "${GREEN}[✓] $service Policy: $resource is compliant.${NC}"
     fi
+
     echo "$service,$resource,N/A,$VERSION,$STATUS" >> "$OUTPUT_FILE"
 }
 
