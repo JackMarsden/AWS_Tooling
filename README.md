@@ -49,7 +49,7 @@ The first script, **EnumerateSchemaVersions.sh**, allows you to enumerate polici
 1. **Clone the Repository:**
 
 ```bash
-git clone https://github.com/YourUsername/AWS_Tooling
+git clone https://github.com/JackMarsden/AWS_Tooling
 ```
 
 2. **Navigate to the Directory:**
