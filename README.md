@@ -107,8 +107,8 @@ chmod +x EnumerateSchemaVersions.sh
 Service,Resource,PolicyNameOrID,PolicyVersion,Status
 
 - Color-coded output:
-  - 🔴 Red: Errors or missing schema version  
-  - 🟡 Yellow: Outdated schema version  
+  - 🔴 Red: Errors or Outdated schema versionmissing schema version  
+  - 🟡 Yellow: missing schema version  
   - 🟢 Green: Up-to-date  
 
 ---
