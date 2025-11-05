@@ -29,6 +29,7 @@ REGION=""
 VERBOSE=false
 OUTPUT_JSON=""
 MIN_SEVERITY="info"
+DIAGNOSTIC=false
 TMP_DIR="./lambda_audit_temp_$(date +%s)"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -71,6 +72,7 @@ OPTIONS:
     --region REGION         AWS region to scan (default: current region)
     --output-json FILE      Export results to JSON file
     --severity LEVEL        Minimum severity to report (info|low|moderate|high|critical)
+    --diagnostic            Enable diagnostic mode (shows npm audit raw output)
     --v                     Verbose output
     --help                  Show this help message
 
@@ -162,6 +164,10 @@ init() {
                 MIN_SEVERITY="$2"
                 shift 2
                 ;;
+            --diagnostic)
+                DIAGNOSTIC=true
+                shift
+                ;;
             --v|--verbose)
                 VERBOSE=true
                 shift
@@ -251,6 +257,9 @@ audit_package() {
     rm -rf "$FUNC_DIR"
     mkdir -p "$FUNC_DIR"
     
+    # Get absolute path for FUNC_DIR to avoid issues with pushd
+    local FUNC_DIR_ABS="$(cd "$FUNC_DIR" && pwd)"
+    
     log_verbose "Downloading $TYPE: $NAME"
     
     if ! curl -sL -o "$FUNC_DIR/code.zip" "$ZIP_URL" 2>/dev/null; then
@@ -270,18 +279,75 @@ audit_package() {
     while IFS= read -r pkg; do
         found=true
         local DIR=$(dirname "$pkg")
-        pushd "$DIR" >/dev/null
-
+        
         log_verbose "Running npm audit in: $DIR"
+        
+        # Generate safe filename from directory path BEFORE pushd
+        local DIR_SAFE=$(echo "$DIR" | tr '/' '_' | sed 's/^_*//' | sed 's/_*$//')
+        [[ -z "$DIR_SAFE" || "$DIR_SAFE" == "." ]] && DIR_SAFE="root"
+        local AUDIT_OUTPUT="$FUNC_DIR_ABS/audit_${DIR_SAFE}.json"
+        
+        pushd "$DIR" >/dev/null
 
         # Generate package-lock.json if missing
         if [[ ! -f package-lock.json ]]; then
+            log_verbose "Generating package-lock.json..."
             npm i --package-lock-only >/dev/null 2>&1 || true
         fi
 
-        # Run audit and save JSON output
-        local AUDIT_OUTPUT="$FUNC_DIR/audit_$(echo $DIR | tr '/' '_').json"
-        npm audit --json > "$AUDIT_OUTPUT" 2>/dev/null || true
+        # Update npm if needed (requires permissions)
+        local NPM_VERSION=$(npm --version | cut -d. -f1)
+        if [[ $NPM_VERSION -lt 8 ]]; then
+            log_warning "npm version $NPM_VERSION detected. Consider upgrading to npm 8+ for better vulnerability detection."
+        fi
+
+        # Run audit with both production and dev dependencies
+        local AUDIT_FAILED=false
+        
+        # Try audit with all dependencies first
+        log_verbose "Attempting npm audit --production=false..."
+        if npm audit --production=false --json > "$AUDIT_OUTPUT" 2>&1; then
+            log_verbose "Audit completed successfully"
+        else
+            AUDIT_FAILED=true
+            log_verbose "Audit with dev dependencies failed, trying production only..."
+            # Fallback to production only
+            if npm audit --json > "$AUDIT_OUTPUT" 2>&1; then
+                log_verbose "Production audit completed"
+            else
+                log_verbose "Production audit also failed, trying without error suppression..."
+                npm audit --json 2>&1 | tee "$AUDIT_OUTPUT" || true
+            fi
+        fi
+
+        # Check if audit output is valid JSON
+        if [[ ! -s "$AUDIT_OUTPUT" ]]; then
+            log_warning "Audit output file is empty for $DIR"
+            echo '{"metadata":{"vulnerabilities":{"info":0,"low":0,"moderate":0,"high":0,"critical":0,"total":0}}}' > "$AUDIT_OUTPUT"
+        elif ! jq empty "$AUDIT_OUTPUT" 2>/dev/null; then
+            log_warning "Invalid JSON in audit results for $DIR"
+            if [[ "$VERBOSE" == true ]]; then
+                log_verbose "Content: $(head -20 "$AUDIT_OUTPUT")"
+            fi
+            echo '{"metadata":{"vulnerabilities":{"info":0,"low":0,"moderate":0,"high":0,"critical":0,"total":0}}}' > "$AUDIT_OUTPUT"
+        fi
+
+        # Display package.json info for debugging
+        if [[ "$VERBOSE" == true ]] && [[ -f package.json ]]; then
+            log_verbose "Dependencies found:"
+            jq -r '.dependencies // {} | keys[]' package.json 2>/dev/null | head -5 | while read dep; do
+                log_verbose "  - $dep"
+            done
+        fi
+
+        # Diagnostic mode - show raw audit output
+        if [[ "$DIAGNOSTIC" == true ]]; then
+            echo -e "${YELLOW}=== DIAGNOSTIC: Raw npm audit output ===${RESET}"
+            cat "$AUDIT_OUTPUT" | jq '.'
+            echo -e "${YELLOW}=== DIAGNOSTIC: Package versions ===${RESET}"
+            npm list --depth=0 2>/dev/null || true
+            echo -e "${YELLOW}=== END DIAGNOSTIC ===${RESET}"
+        fi
 
         # Parse and display results
         parse_audit_results "$AUDIT_OUTPUT" "$NAME ($(basename $DIR))" "$TYPE"
