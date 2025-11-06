@@ -14,6 +14,9 @@
 
 set -uo pipefail
 
+# Disable unbound variable check for specific cases
+set +u
+
 # Configuration
 PROFILE=""
 REGION=""
@@ -27,6 +30,20 @@ YELLOW="\e[33m"
 CYAN="\e[36m"
 BOLD="\e[1m"
 RESET="\e[0m"
+
+# Counters
+NODEJS_COUNT=0
+NON_NODEJS_COUNT=0
+LAYER_COUNT=0
+TOTAL_CRITICAL=0
+TOTAL_HIGH=0
+TOTAL_MODERATE=0
+TOTAL_LOW=0
+TOTAL_INFO=0
+
+# Arrays to store results
+declare -a FUNCTION_NAMES
+declare -A FUNCTION_RESULTS
 
 show_help() {
     cat << EOF
@@ -171,7 +188,7 @@ cleanup() {
     if [[ -n "$TMP_DIR" ]] && [[ -d "$TMP_DIR" ]]; then
         cd ..
         # Remove zip files and unzipped directories, keep result files
-        find "$TMP_DIR" -name "*.zip" -delete
+        find "$TMP_DIR" -name "*.zip" -delete 2>/dev/null || true
         find "$TMP_DIR" -type d -mindepth 1 -exec rm -rf {} + 2>/dev/null || true
         log_info "Cleaned up zip files and directories (kept audit results)"
     fi
@@ -244,6 +261,12 @@ for ZIP_FILE in *.zip; do
     FUNC_NAME="${ZIP_FILE%.zip}"
     FUNC_DIR="$FUNC_NAME"
     
+    # Add function name to array
+    FUNCTION_NAMES+=("$FUNC_NAME")
+    
+    # Initialize counters for this function
+    FUNCTION_RESULTS["$FUNC_NAME"]="0|0|0|0|0"
+    
     echo -e "${BOLD}Processing: $FUNC_NAME${RESET}"
     
     # Unzip into its own directory
@@ -254,7 +277,7 @@ for ZIP_FILE in *.zip; do
     fi
     
     # Find all package.json files (excluding node_modules)
-    PACKAGE_JSONS=$(find "$FUNC_DIR" -name "package.json" -not -path "*/node_modules/*" 2>/dev/null || true)
+    PACKAGE_JSONS=$(find "$FUNC_DIR" -type f -name "package.json" -not -path "*/node_modules/*" 2>/dev/null || true)
     
     if [[ -z "$PACKAGE_JSONS" ]]; then
         log_error "No package.json found in $FUNC_NAME"
@@ -262,21 +285,48 @@ for ZIP_FILE in *.zip; do
         continue
     fi
     
+    # Count how many package.json files found
+    PKG_COUNT=$(echo "$PACKAGE_JSONS" | wc -l | tr -d ' ')
+    log_info "Found $PKG_COUNT package.json file(s) to audit"
+    
     # Run npm audit for each package.json found
-    echo "$PACKAGE_JSONS" | while read -r PKG_JSON; do
+    PKG_NUM=0
+    while IFS= read -r PKG_JSON; do
+        PKG_NUM=$((PKG_NUM + 1))
         PKG_DIR=$(dirname "$PKG_JSON")
         
-        log_info "Auditing: $PKG_DIR"
+        # Get the absolute path of the package directory
+        PKG_DIR_ABS=$(cd "$PKG_DIR" && pwd)
         
-        # Get absolute path for audit file to avoid path issues
-        AUDIT_FILE="$(pwd)/${FUNC_NAME}-auditResults.json"
+        # Create a unique identifier for this package location
+        PKG_SUBPATH=$(echo "$PKG_DIR_ABS" | sed "s|^$(cd "$FUNC_DIR" && pwd)||" | sed 's|^/||' | tr '/' '_')
+        [[ -z "$PKG_SUBPATH" ]] && PKG_SUBPATH="root"
+        
+        log_info "Auditing [$PKG_NUM/$PKG_COUNT]: $PKG_DIR"
+        
+        # Get absolute path for audit file with unique name for each package.json
+        AUDIT_FILE="$(pwd)/${FUNC_NAME}-${PKG_SUBPATH}-auditResults.json"
         
         (
-            cd "$PKG_DIR" || exit 0
+            cd "$PKG_DIR_ABS" || exit 0
             
-            # Generate package-lock.json if missing
-            if [[ ! -f package-lock.json ]]; then
+            # Check if there's actually a real package.json (not in node_modules)
+            if [[ ! -f "package.json" ]]; then
+                log_error "  package.json not found in current directory"
+                exit 0
+            fi
+            
+            # Generate package-lock.json if missing (and it's not a hidden file)
+            if [[ ! -f "package-lock.json" ]]; then
+                log_info "  Generating package-lock.json..."
                 npm install --package-lock-only >/dev/null 2>&1 || true
+            fi
+            
+            # Skip if we still don't have a proper package-lock.json after generation
+            if [[ ! -f "package-lock.json" ]]; then
+                log_error "  Could not generate package-lock.json, skipping..."
+                echo '{"metadata":{"vulnerabilities":{"critical":0,"high":0,"moderate":0,"low":0,"info":0,"total":0},"error":"no_package_lock"}}' > "$AUDIT_FILE" 2>/dev/null || true
+                exit 0
             fi
             
             # Run npm audit
@@ -295,29 +345,67 @@ for ZIP_FILE in *.zip; do
                 HIGH=$(jq -r '.metadata.vulnerabilities.high // 0' "$AUDIT_FILE" 2>/dev/null || echo 0)
                 MODERATE=$(jq -r '.metadata.vulnerabilities.moderate // 0' "$AUDIT_FILE" 2>/dev/null || echo 0)
                 LOW=$(jq -r '.metadata.vulnerabilities.low // 0' "$AUDIT_FILE" 2>/dev/null || echo 0)
+                INFO=$(jq -r '.metadata.vulnerabilities.info // 0' "$AUDIT_FILE" 2>/dev/null || echo 0)
                 TOTAL=$(jq -r '.metadata.vulnerabilities.total // 0' "$AUDIT_FILE" 2>/dev/null || echo 0)
                 
                 if [[ $TOTAL -gt 0 ]]; then
-                    echo -e "  ${RED}Critical: $CRITICAL${RESET} | ${YELLOW}High: $HIGH${RESET} | Moderate: $MODERATE | Low: $LOW | ${BOLD}Total: $TOTAL${RESET}"
+                    echo -e "  ${RED}Critical: $CRITICAL${RESET} | ${YELLOW}High: $HIGH${RESET} | Moderate: $MODERATE | Low: $LOW | Info: $INFO | ${BOLD}Total: $TOTAL${RESET}"
                 else
-                    log_success "No vulnerabilities found"
+                    log_success "  No vulnerabilities found"
                 fi
             else
-                log_error "Failed to generate valid audit results"
+                log_error "  Failed to generate valid audit results"
                 # Create empty result file with error handling
                 mkdir -p "$(dirname "$AUDIT_FILE")" 2>/dev/null || true
-                echo '{"metadata":{"vulnerabilities":{"critical":0,"high":0,"moderate":0,"low":0,"total":0},"error":"invalid_audit_output"}}' > "$AUDIT_FILE" 2>/dev/null || true
+                echo '{"metadata":{"vulnerabilities":{"critical":0,"high":0,"moderate":0,"low":0,"info":0,"total":0},"error":"invalid_audit_output"}}' > "$AUDIT_FILE" 2>/dev/null || true
             fi
         ) || {
-            log_error "Audit failed for $PKG_DIR, continuing with next package..."
+            log_error "  Audit failed for $PKG_DIR, continuing with next package..."
             # Create error result file with path safety
             mkdir -p "$(dirname "$AUDIT_FILE")" 2>/dev/null || true
-            echo '{"metadata":{"vulnerabilities":{"critical":0,"high":0,"moderate":0,"low":0,"total":0},"error":"audit_failed"}}' > "$AUDIT_FILE" 2>/dev/null || true
+            echo '{"metadata":{"vulnerabilities":{"critical":0,"high":0,"moderate":0,"low":0,"info":0,"total":0},"error":"audit_failed"}}' > "$AUDIT_FILE" 2>/dev/null || true
         }
-    done
+    done <<< "$PACKAGE_JSONS"
     
     echo
 done
+
+# Aggregate results per function after all functions have been processed
+log_section "Aggregating Results"
+
+# Process each function we tracked
+for FUNC_NAME in "${FUNCTION_NAMES[@]}"; do
+    FUNC_CRITICAL=0
+    FUNC_HIGH=0
+    FUNC_MODERATE=0
+    FUNC_LOW=0
+    FUNC_INFO=0
+    
+    # Find all audit result files for this function
+    for RESULT_FILE in "${FUNC_NAME}"-*-auditResults.json; do
+        [[ ! -f "$RESULT_FILE" ]] && continue
+        
+        if jq empty "$RESULT_FILE" 2>/dev/null; then
+            FUNC_CRITICAL=$((FUNC_CRITICAL + $(jq -r '.metadata.vulnerabilities.critical // 0' "$RESULT_FILE" 2>/dev/null || echo 0)))
+            FUNC_HIGH=$((FUNC_HIGH + $(jq -r '.metadata.vulnerabilities.high // 0' "$RESULT_FILE" 2>/dev/null || echo 0)))
+            FUNC_MODERATE=$((FUNC_MODERATE + $(jq -r '.metadata.vulnerabilities.moderate // 0' "$RESULT_FILE" 2>/dev/null || echo 0)))
+            FUNC_LOW=$((FUNC_LOW + $(jq -r '.metadata.vulnerabilities.low // 0' "$RESULT_FILE" 2>/dev/null || echo 0)))
+            FUNC_INFO=$((FUNC_INFO + $(jq -r '.metadata.vulnerabilities.info // 0' "$RESULT_FILE" 2>/dev/null || echo 0)))
+        fi
+    done
+    
+    # Store function totals
+    FUNCTION_RESULTS["$FUNC_NAME"]="$FUNC_CRITICAL|$FUNC_HIGH|$FUNC_MODERATE|$FUNC_LOW|$FUNC_INFO"
+    
+    # Update global totals
+    TOTAL_CRITICAL=$((TOTAL_CRITICAL + FUNC_CRITICAL))
+    TOTAL_HIGH=$((TOTAL_HIGH + FUNC_HIGH))
+    TOTAL_MODERATE=$((TOTAL_MODERATE + FUNC_MODERATE))
+    TOTAL_LOW=$((TOTAL_LOW + FUNC_LOW))
+    TOTAL_INFO=$((TOTAL_INFO + FUNC_INFO))
+done
+
+log_success "Aggregation complete"
 
 # Step 5: Remove downloaded zips and unzipped directories
 log_section "Cleanup"
@@ -335,20 +423,84 @@ log_success "Cleanup complete"
 
 # Show final results
 echo
-log_section "Audit Results"
+log_section "Audit Results Summary"
 
+# Calculate grand total
+GRAND_TOTAL=$((TOTAL_CRITICAL + TOTAL_HIGH + TOTAL_MODERATE + TOTAL_LOW + TOTAL_INFO))
+
+# Display overall summary
+echo -e "${BOLD}Overall Vulnerability Summary:${RESET}"
+echo
+printf "  %-15s %8s\n" "Severity" "Count"
+printf "  %s\n" "$(printf '%.0s─' {1..25})"
+[[ $TOTAL_CRITICAL -gt 0 ]] && printf "  ${RED}%-15s${RESET} %8d\n" "Critical" "$TOTAL_CRITICAL" || printf "  %-15s %8d\n" "Critical" "$TOTAL_CRITICAL"
+[[ $TOTAL_HIGH -gt 0 ]] && printf "  ${YELLOW}%-15s${RESET} %8d\n" "High" "$TOTAL_HIGH" || printf "  %-15s %8d\n" "High" "$TOTAL_HIGH"
+[[ $TOTAL_MODERATE -gt 0 ]] && printf "  ${CYAN}%-15s${RESET} %8d\n" "Moderate" "$TOTAL_MODERATE" || printf "  %-15s %8d\n" "Moderate" "$TOTAL_MODERATE"
+printf "  %-15s %8d\n" "Low" "$TOTAL_LOW"
+printf "  %-15s %8d\n" "Info" "$TOTAL_INFO"
+printf "  %s\n" "$(printf '%.0s─' {1..25})"
+printf "  ${BOLD}%-15s %8d${RESET}\n" "TOTAL" "$GRAND_TOTAL"
+
+echo
+echo
+
+# Display per-function breakdown
+if [[ ${#FUNCTION_NAMES[@]} -gt 0 ]]; then
+    echo -e "${BOLD}Vulnerabilities by Lambda Function:${RESET}"
+    echo
+    printf "  %-40s %10s %10s %10s %10s %10s %10s\n" "Function Name" "Critical" "High" "Moderate" "Low" "Info" "Total"
+    printf "  %s\n" "$(printf '%.0s─' {1..100})"
+    
+    # Sort function names by total vulnerabilities (highest first)
+    for FUNC_NAME in $(for name in "${FUNCTION_NAMES[@]}"; do
+        IFS='|' read -r crit high mod low info <<< "${FUNCTION_RESULTS[$name]}"
+        total=$((crit + high + mod + low + info))
+        echo "$total|$name"
+    done | sort -rn | cut -d'|' -f2); do
+        
+        IFS='|' read -r CRIT HIGH MOD LOW INFO <<< "${FUNCTION_RESULTS[$FUNC_NAME]}"
+        FUNC_TOTAL=$((CRIT + HIGH + MOD + LOW + INFO))
+        
+        # Truncate long function names
+        DISPLAY_NAME="$FUNC_NAME"
+        if [[ ${#DISPLAY_NAME} -gt 38 ]]; then
+            DISPLAY_NAME="${DISPLAY_NAME:0:35}..."
+        fi
+        
+        # Color code the row if it has critical or high vulnerabilities
+        if [[ $CRIT -gt 0 ]]; then
+            printf "  ${RED}%-40s %10d %10d %10d %10d %10d %10d${RESET}\n" "$DISPLAY_NAME" "$CRIT" "$HIGH" "$MOD" "$LOW" "$INFO" "$FUNC_TOTAL"
+        elif [[ $HIGH -gt 0 ]]; then
+            printf "  ${YELLOW}%-40s %10d %10d %10d %10d %10d %10d${RESET}\n" "$DISPLAY_NAME" "$CRIT" "$HIGH" "$MOD" "$LOW" "$INFO" "$FUNC_TOTAL"
+        else
+            printf "  %-40s %10d %10d %10d %10d %10d %10d\n" "$DISPLAY_NAME" "$CRIT" "$HIGH" "$MOD" "$LOW" "$INFO" "$FUNC_TOTAL"
+        fi
+    done
+    
+    printf "  %s\n" "$(printf '%.0s─' {1..100})"
+    printf "  ${BOLD}%-40s %10d %10d %10d %10d %10d %10d${RESET}\n" "TOTAL" "$TOTAL_CRITICAL" "$TOTAL_HIGH" "$TOTAL_MODERATE" "$TOTAL_LOW" "$TOTAL_INFO" "$GRAND_TOTAL"
+fi
+
+echo
+echo
+
+# Show result files location
 RESULT_FILES=$(ls *-auditResults.json 2>/dev/null || true)
 
 if [[ -z "$RESULT_FILES" ]]; then
     log_error "No audit result files found"
 else
     RESULT_COUNT=$(echo "$RESULT_FILES" | wc -l | tr -d ' ')
-    log_success "Generated $RESULT_COUNT audit result file(s):"
-    echo
+    log_success "Generated $RESULT_COUNT audit result file(s) in: $(pwd)"
     
-    for RESULT_FILE in *-auditResults.json; do
-        echo "  📄 $(pwd)/$RESULT_FILE"
-    done
+    if [[ $GRAND_TOTAL -eq 0 ]]; then
+        echo
+        log_success "🎉 No vulnerabilities detected across all Lambda functions!"
+    elif [[ $TOTAL_CRITICAL -gt 0 ]] || [[ $TOTAL_HIGH -gt 0 ]]; then
+        echo
+        log_error "⚠️  Critical or High severity vulnerabilities detected!"
+        log_info "Review the audit result files for detailed information"
+    fi
 fi
 
 echo
