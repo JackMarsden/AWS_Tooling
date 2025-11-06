@@ -8,6 +8,7 @@
 # Options:
 #   --profile PROFILE    AWS profile to use
 #   --region REGION      AWS region to scan
+#   --mode MODE          Operation mode: audit (default), download, auditLocal
 #   --v                  Verbose output (shows npm audit results in terminal)
 #   --help               Show this help message
 #
@@ -21,6 +22,7 @@ set +u
 PROFILE=""
 REGION=""
 VERBOSE=false
+MODE="audit"
 TMP_DIR=""
 
 # Colors
@@ -57,12 +59,18 @@ USAGE:
 OPTIONS:
     --profile PROFILE    AWS profile to use
     --region REGION      AWS region to scan
+    --mode MODE          Operation mode (default: audit)
+                           audit       - Download and audit Lambda functions
+                           download    - Only download Lambda functions
+                           auditLocal  - Audit Lambda functions in current directory
     --v                  Verbose output (shows npm audit in terminal)
     --help               Show this help message
 
 EXAMPLES:
     $0
     $0 --profile prod --region us-east-1 --v
+    $0 --mode download --profile prod
+    $0 --mode auditLocal
 EOF
 }
 
@@ -97,6 +105,15 @@ while [[ $# -gt 0 ]]; do
             REGION="$2"
             shift 2
             ;;
+        --mode)
+            MODE="$2"
+            if [[ "$MODE" != "audit" ]] && [[ "$MODE" != "download" ]] && [[ "$MODE" != "auditLocal" ]]; then
+                log_error "Invalid mode: $MODE. Must be 'audit', 'download', or 'auditLocal'"
+                show_help
+                exit 1
+            fi
+            shift 2
+            ;;
         --v|--verbose)
             VERBOSE=true
             shift
@@ -115,144 +132,201 @@ done
 
 log_section "Lambda NPM Audit - Initialization"
 
-# Check dependencies
+# Check dependencies based on mode
 log_info "Checking required dependencies..."
 MISSING_DEPS=()
-for cmd in aws jq unzip npm curl; do
-    if ! command -v $cmd >/dev/null 2>&1; then
-        MISSING_DEPS+=("$cmd")
-    fi
-done
+
+if [[ "$MODE" == "auditLocal" ]]; then
+    # auditLocal mode only needs npm and jq
+    for cmd in jq npm; do
+        if ! command -v $cmd >/dev/null 2>&1; then
+            MISSING_DEPS+=("$cmd")
+        fi
+    done
+else
+    # audit and download modes need all dependencies
+    for cmd in aws jq unzip npm curl; do
+        if ! command -v $cmd >/dev/null 2>&1; then
+            MISSING_DEPS+=("$cmd")
+        fi
+    done
+fi
 
 if [[ ${#MISSING_DEPS[@]} -gt 0 ]]; then
     log_error "Missing required dependencies: ${MISSING_DEPS[*]}"
     echo "Please install the missing dependencies and try again."
     exit 1
 fi
-log_success "All dependencies found (aws, jq, unzip, npm, curl)"
+
+if [[ "$MODE" == "auditLocal" ]]; then
+    log_success "All dependencies found (jq, npm)"
+else
+    log_success "All dependencies found (aws, jq, unzip, npm, curl)"
+fi
 
 # Build AWS CLI options
 AWS_OPTS=""
 [[ -n "$PROFILE" ]] && AWS_OPTS="$AWS_OPTS --profile $PROFILE"
 [[ -n "$REGION" ]] && AWS_OPTS="$AWS_OPTS --region $REGION"
 
-# Verify AWS authentication
-log_info "Verifying AWS authentication..."
-if [[ -n "$PROFILE" ]]; then
-    echo -e "  ${BOLD}Profile:${RESET} $PROFILE"
-else
-    echo -e "  ${BOLD}Profile:${RESET} default"
-fi
-
-# Test AWS credentials
-if ! AWS_IDENTITY=$(aws sts get-caller-identity $AWS_OPTS --output json 2>&1); then
-    log_error "AWS authentication failed"
-    echo
-    echo "Error details:"
-    echo "$AWS_IDENTITY"
-    echo
+# Verify AWS authentication (skip for auditLocal mode)
+if [[ "$MODE" != "auditLocal" ]]; then
+    log_info "Verifying AWS authentication..."
     if [[ -n "$PROFILE" ]]; then
-        echo "Please verify:"
-        echo "  1. Profile '$PROFILE' exists in ~/.aws/credentials or ~/.aws/config"
-        echo "  2. Profile has valid credentials"
-        echo "  3. You have network connectivity to AWS"
+        echo -e "  ${BOLD}Profile:${RESET} $PROFILE"
     else
-        echo "Please verify:"
-        echo "  1. AWS credentials are configured (run 'aws configure')"
-        echo "  2. You have network connectivity to AWS"
+        echo -e "  ${BOLD}Profile:${RESET} default"
     fi
-    exit 1
+
+    # Test AWS credentials
+    if ! AWS_IDENTITY=$(aws sts get-caller-identity $AWS_OPTS --output json 2>&1); then
+        log_error "AWS authentication failed"
+        echo
+        echo "Error details:"
+        echo "$AWS_IDENTITY"
+        echo
+        if [[ -n "$PROFILE" ]]; then
+            echo "Please verify:"
+            echo "  1. Profile '$PROFILE' exists in ~/.aws/credentials or ~/.aws/config"
+            echo "  2. Profile has valid credentials"
+            echo "  3. You have network connectivity to AWS"
+        else
+            echo "Please verify:"
+            echo "  1. AWS credentials are configured (run 'aws configure')"
+            echo "  2. You have network connectivity to AWS"
+        fi
+        exit 1
+    fi
+
+    # Display authentication info
+    ACCOUNT_ID=$(echo "$AWS_IDENTITY" | jq -r '.Account')
+    USER_ARN=$(echo "$AWS_IDENTITY" | jq -r '.Arn')
+    CURRENT_REGION=$(aws configure get region $([[ -n "$PROFILE" ]] && echo "--profile $PROFILE") 2>/dev/null || echo "us-east-1")
+    [[ -n "$REGION" ]] && CURRENT_REGION="$REGION"
+
+    log_success "AWS authentication successful"
+    echo -e "  ${BOLD}Account ID:${RESET} $ACCOUNT_ID"
+    echo -e "  ${BOLD}Identity:${RESET} $USER_ARN"
+    echo -e "  ${BOLD}Region:${RESET} $CURRENT_REGION"
 fi
-
-# Display authentication info
-ACCOUNT_ID=$(echo "$AWS_IDENTITY" | jq -r '.Account')
-USER_ARN=$(echo "$AWS_IDENTITY" | jq -r '.Arn')
-CURRENT_REGION=$(aws configure get region $([[ -n "$PROFILE" ]] && echo "--profile $PROFILE") 2>/dev/null || echo "us-east-1")
-[[ -n "$REGION" ]] && CURRENT_REGION="$REGION"
-
-log_success "AWS authentication successful"
-echo -e "  ${BOLD}Account ID:${RESET} $ACCOUNT_ID"
-echo -e "  ${BOLD}Identity:${RESET} $USER_ARN"
-echo -e "  ${BOLD}Region:${RESET} $CURRENT_REGION"
 
 log_section "Lambda NPM Audit"
 
-# Step 1: Create temp directory and cd into it
-TMP_DIR="./lambda_audit_$(date +%s)"
-mkdir -p "$TMP_DIR"
-cd "$TMP_DIR"
-log_success "Created temp directory: $TMP_DIR"
+# Mode-specific setup
+if [[ "$MODE" == "auditLocal" ]]; then
+    log_info "Mode: Audit Local - Processing Lambda functions in current directory"
+    TMP_DIR="."
+    
+    # Check if there are any zip files in current directory
+    ZIP_COUNT=$(ls -1 *.zip 2>/dev/null | wc -l | tr -d ' ')
+    if [[ $ZIP_COUNT -eq 0 ]]; then
+        log_error "No Lambda function zip files found in current directory"
+        echo "Please ensure you have Lambda function zip files in the current directory"
+        exit 1
+    fi
+    
+    log_success "Found $ZIP_COUNT Lambda function zip file(s) to audit"
+    
+else
+    # Step 1: Create temp directory and cd into it
+    TMP_DIR="./lambda_audit_$(date +%s)"
+    mkdir -p "$TMP_DIR"
+    cd "$TMP_DIR"
+    log_success "Created temp directory: $TMP_DIR"
+fi
 
 # Cleanup on exit
 cleanup() {
-    if [[ -n "$TMP_DIR" ]] && [[ -d "$TMP_DIR" ]]; then
-        cd ..
-        # Remove zip files and unzipped directories, keep result files
-        find "$TMP_DIR" -name "*.zip" -delete 2>/dev/null || true
-        find "$TMP_DIR" -type d -mindepth 1 -exec rm -rf {} + 2>/dev/null || true
-        log_info "Cleaned up zip files and directories (kept audit results)"
+    if [[ "$MODE" == "auditLocal" ]]; then
+        # For auditLocal mode, only clean up unzipped directories
+        if [[ -n "$TMP_DIR" ]] && [[ -d "$TMP_DIR" ]]; then
+            find "$TMP_DIR" -type d -mindepth 1 -maxdepth 1 -not -name "*auditResults.json" -exec rm -rf {} + 2>/dev/null || true
+            log_info "Cleaned up unzipped directories (kept zip files and audit results)"
+        fi
+    elif [[ "$MODE" == "download" ]]; then
+        # For download mode, don't clean up anything
+        log_info "Download mode: Keeping all downloaded files"
+    else
+        # For audit mode, clean up as usual
+        if [[ -n "$TMP_DIR" ]] && [[ -d "$TMP_DIR" ]]; then
+            cd ..
+            # Remove zip files and unzipped directories, keep result files
+            find "$TMP_DIR" -name "*.zip" -delete 2>/dev/null || true
+            find "$TMP_DIR" -type d -mindepth 1 -exec rm -rf {} + 2>/dev/null || true
+            log_info "Cleaned up zip files and directories (kept audit results)"
+        fi
     fi
 }
 trap cleanup EXIT
 
-# Step 2: Download only Node.js Lambda functions
-log_info "Fetching Node.js Lambda functions..."
+# Step 2: Download only Node.js Lambda functions (skip for auditLocal mode)
+if [[ "$MODE" != "auditLocal" ]]; then
+    log_info "Fetching Node.js Lambda functions..."
 
-# Get list of Node.js functions with their runtimes
-FUNCTIONS_JSON=$(aws lambda list-functions $AWS_OPTS --query 'Functions[?starts_with(Runtime, `nodejs`)].[FunctionName, Runtime]' --output json)
-FUNC_COUNT=$(echo "$FUNCTIONS_JSON" | jq -r '. | length')
+    # Get list of Node.js functions with their runtimes
+    FUNCTIONS_JSON=$(aws lambda list-functions $AWS_OPTS --query 'Functions[?starts_with(Runtime, `nodejs`)].[FunctionName, Runtime]' --output json)
+    FUNC_COUNT=$(echo "$FUNCTIONS_JSON" | jq -r '. | length')
 
-if [[ $FUNC_COUNT -eq 0 ]]; then
-    log_error "No Node.js Lambda functions found"
-    exit 0
-fi
-
-log_success "Found $FUNC_COUNT Node.js Lambda function(s)"
-echo
-
-# Display table of functions to download
-echo -e "${BOLD}Node.js Lambda Functions:${RESET}"
-echo "$FUNCTIONS_JSON" | jq -r '.[] | "  - \(.[0]) (\(.[1]))"'
-echo
-
-# Download all Node.js functions
-echo "$FUNCTIONS_JSON" | jq -r '.[][0]' | while read -r FUNC_NAME; do
-    log_info "Downloading: $FUNC_NAME"
-    
-    # Get function code location
-    if ! CODE_URL=$(aws lambda get-function $AWS_OPTS --function-name "$FUNC_NAME" --query 'Code.Location' --output text 2>&1); then
-        log_error "Failed to get code URL for $FUNC_NAME: $CODE_URL"
-        continue
+    if [[ $FUNC_COUNT -eq 0 ]]; then
+        log_error "No Node.js Lambda functions found"
+        exit 0
     fi
-    
-    if [[ -z "$CODE_URL" ]] || [[ "$CODE_URL" == "None" ]]; then
-        log_error "No code URL available for $FUNC_NAME"
-        continue
-    fi
-    
-    # Download zip file with retries
-    RETRY_COUNT=0
-    MAX_RETRIES=3
-    DOWNLOAD_SUCCESS=false
-    
-    while [[ $RETRY_COUNT -lt $MAX_RETRIES ]]; do
-        if curl -sL -f -o "${FUNC_NAME}.zip" "$CODE_URL" 2>/dev/null; then
-            DOWNLOAD_SUCCESS=true
-            break
+
+    log_success "Found $FUNC_COUNT Node.js Lambda function(s)"
+    echo
+
+    # Display table of functions to download
+    echo -e "${BOLD}Node.js Lambda Functions:${RESET}"
+    echo "$FUNCTIONS_JSON" | jq -r '.[] | "  - \(.[0]) (\(.[1]))"'
+    echo
+
+    # Download all Node.js functions
+    echo "$FUNCTIONS_JSON" | jq -r '.[][0]' | while read -r FUNC_NAME; do
+        log_info "Downloading: $FUNC_NAME"
+        
+        # Get function code location
+        if ! CODE_URL=$(aws lambda get-function $AWS_OPTS --function-name "$FUNC_NAME" --query 'Code.Location' --output text 2>&1); then
+            log_error "Failed to get code URL for $FUNC_NAME: $CODE_URL"
+            continue
         fi
-        RETRY_COUNT=$((RETRY_COUNT + 1))
-        [[ $RETRY_COUNT -lt $MAX_RETRIES ]] && sleep 2
+        
+        if [[ -z "$CODE_URL" ]] || [[ "$CODE_URL" == "None" ]]; then
+            log_error "No code URL available for $FUNC_NAME"
+            continue
+        fi
+        
+        # Download zip file with retries
+        RETRY_COUNT=0
+        MAX_RETRIES=3
+        DOWNLOAD_SUCCESS=false
+        
+        while [[ $RETRY_COUNT -lt $MAX_RETRIES ]]; do
+            if curl -sL -f -o "${FUNC_NAME}.zip" "$CODE_URL" 2>/dev/null; then
+                DOWNLOAD_SUCCESS=true
+                break
+            fi
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+            [[ $RETRY_COUNT -lt $MAX_RETRIES ]] && sleep 2
+        done
+        
+        if [[ "$DOWNLOAD_SUCCESS" == true ]]; then
+            log_success "Downloaded: ${FUNC_NAME}.zip"
+        else
+            log_error "Failed to download after $MAX_RETRIES attempts: $FUNC_NAME"
+        fi
     done
-    
-    if [[ "$DOWNLOAD_SUCCESS" == true ]]; then
-        log_success "Downloaded: ${FUNC_NAME}.zip"
-    else
-        log_error "Failed to download after $MAX_RETRIES attempts: $FUNC_NAME"
-    fi
-done
 
-echo
-log_section "Processing Lambda Functions"
+    echo
+    
+    # If download mode, exit here
+    if [[ "$MODE" == "download" ]]; then
+        log_section "Download Complete"
+        log_success "All Lambda functions downloaded to: $(pwd)"
+        exit 0
+    fi
+    
+    log_section "Processing Lambda Functions"
+fi
 
 # Step 3 & 4: Unzip and audit each function
 for ZIP_FILE in *.zip; do
@@ -276,8 +350,8 @@ for ZIP_FILE in *.zip; do
         continue
     fi
     
-    # Find all package.json files (excluding node_modules)
-    PACKAGE_JSONS=$(find "$FUNC_DIR" -type f -name "package.json" -not -path "*/node_modules/*" 2>/dev/null || true)
+    # Find ALL package.json files (including nested node_modules)
+    PACKAGE_JSONS=$(find "$FUNC_DIR" -type f -name "package.json" 2>/dev/null || true)
     
     if [[ -z "$PACKAGE_JSONS" ]]; then
         log_error "No package.json found in $FUNC_NAME"
@@ -287,11 +361,13 @@ for ZIP_FILE in *.zip; do
     
     # Count how many package.json files found
     PKG_COUNT=$(echo "$PACKAGE_JSONS" | wc -l | tr -d ' ')
-    log_info "Found $PKG_COUNT package.json file(s) to audit"
+    log_info "Found $PKG_COUNT package.json file(s) to audit (including all nested packages)"
     
     # Run npm audit for each package.json found
     PKG_NUM=0
     while IFS= read -r PKG_JSON; do
+        [[ -z "$PKG_JSON" ]] && continue
+        
         PKG_NUM=$((PKG_NUM + 1))
         PKG_DIR=$(dirname "$PKG_JSON")
         
@@ -299,10 +375,11 @@ for ZIP_FILE in *.zip; do
         PKG_DIR_ABS=$(cd "$PKG_DIR" && pwd)
         
         # Create a unique identifier for this package location
-        PKG_SUBPATH=$(echo "$PKG_DIR_ABS" | sed "s|^$(cd "$FUNC_DIR" && pwd)||" | sed 's|^/||' | tr '/' '_')
+        FUNC_DIR_ABS=$(cd "$FUNC_DIR" && pwd)
+        PKG_SUBPATH=$(echo "$PKG_DIR_ABS" | sed "s|^${FUNC_DIR_ABS}||" | sed 's|^/||' | tr '/' '_')
         [[ -z "$PKG_SUBPATH" ]] && PKG_SUBPATH="root"
         
-        log_info "Auditing [$PKG_NUM/$PKG_COUNT]: $PKG_DIR"
+        log_info "Auditing [$PKG_NUM/$PKG_COUNT]: $PKG_SUBPATH"
         
         # Get absolute path for audit file with unique name for each package.json
         AUDIT_FILE="$(pwd)/${FUNC_NAME}-${PKG_SUBPATH}-auditResults.json"
@@ -310,13 +387,13 @@ for ZIP_FILE in *.zip; do
         (
             cd "$PKG_DIR_ABS" || exit 0
             
-            # Check if there's actually a real package.json (not in node_modules)
+            # Check if there's actually a real package.json
             if [[ ! -f "package.json" ]]; then
                 log_error "  package.json not found in current directory"
                 exit 0
             fi
             
-            # Generate package-lock.json if missing (and it's not a hidden file)
+            # Generate package-lock.json if missing
             if [[ ! -f "package-lock.json" ]]; then
                 log_info "  Generating package-lock.json..."
                 npm install --package-lock-only >/dev/null 2>&1 || true
