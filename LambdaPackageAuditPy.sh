@@ -1,123 +1,86 @@
 #!/usr/bin/env bash
 #
-# Lambda Python Audit Script
-# Audits all Python Lambda functions and their layers for package vulnerabilities
+# Lambda Python Security Audit Script
+# Audits all Python Lambda functions for package vulnerabilities using pip-audit
 #
-# Features:
-# - Audits all Lambda functions with Python runtimes
-# - Audits associated Lambda layers
-# - Generates summary report with vulnerability counts
-# - Supports multiple AWS profiles and regions
-# - Optional JSON output for CI/CD integration
-#
-# Usage: ./LambdaPackageAuditPython.sh [OPTIONS]
+# Usage: ./lambda_audit_python.sh [OPTIONS]
 #
 # Options:
-#   --profile PROFILE    AWS profile to use (default: default profile)
-#   --region REGION      AWS region to scan (default: all regions)
-#   --output-json FILE   Export results to JSON file
-#   --severity LEVEL     Only show vulnerabilities >= LEVEL (low|medium|high|critical)
-#   --diagnostic         Enable diagnostic mode (shows pip-audit raw output)
-#   --v                  Verbose output
+#   --profile PROFILE    AWS profile to use
+#   --region REGION      AWS region to scan
+#   --mode MODE          Operation mode: audit (default), download, auditLocal
+#   --v                  Verbose output (shows pip-audit results in terminal)
 #   --help               Show this help message
 #
 
-set -euo pipefail
+set -uo pipefail
 
-# ====== Configuration ======
+# Disable unbound variable check for specific cases
+set +u
+
+# Configuration
 PROFILE=""
 REGION=""
 VERBOSE=false
-OUTPUT_JSON=""
-MIN_SEVERITY="low"
-DIAGNOSTIC=false
-TMP_DIR="./lambda_audit_temp_$(date +%s)"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MODE="audit"
+TMP_DIR=""
 
 # Colors
 RED="\e[31m"
 GREEN="\e[32m"
 YELLOW="\e[33m"
 CYAN="\e[36m"
-BLUE="\e[34m"
-MAGENTA="\e[35m"
 BOLD="\e[1m"
 RESET="\e[0m"
 
 # Counters
-PYTHON_COUNT=0
-NON_PYTHON_COUNT=0
-LAYER_COUNT=0
 TOTAL_CRITICAL=0
 TOTAL_HIGH=0
-TOTAL_MEDIUM=0
+TOTAL_MODERATE=0
 TOTAL_LOW=0
+TOTAL_INFO=0
 
-# Arrays to track layers and results
-declare -A LAYERS_TO_PROCESS
-declare -a AUDIT_RESULTS
+# Arrays to store results
+declare -a FUNCTION_NAMES
+declare -A FUNCTION_RESULTS
 
-# ====== Helper Functions ======
 show_help() {
     cat << EOF
-Lambda Python Audit Script
+Lambda Python Security Audit Script
 
-Audits all Python Lambda functions and their layers for package vulnerabilities.
+Audits all Python Lambda functions for package vulnerabilities using pip-audit.
 
 USAGE:
     $0 [OPTIONS]
 
 OPTIONS:
-    --profile PROFILE       AWS profile to use (default: default profile)
-    --region REGION         AWS region to scan (default: current region)
-    --output-json FILE      Export results to JSON file
-    --severity LEVEL        Minimum severity to report (low|medium|high|critical)
-    --diagnostic            Enable diagnostic mode (shows pip-audit raw output)
-    --v                     Verbose output
-    --help                  Show this help message
+    --profile PROFILE    AWS profile to use
+    --region REGION      AWS region to scan
+    --mode MODE          Operation mode (default: audit)
+                           audit       - Download and audit Lambda functions
+                           download    - Only download Lambda functions
+                           auditLocal  - Audit Lambda functions in current directory
+    --v                  Verbose output (shows pip-audit in terminal)
+    --help               Show this help message
 
 EXAMPLES:
-    # Audit all Lambda functions in default region
     $0
-
-    # Audit with specific profile and region
-    $0 --profile prod --region us-east-1
-
-    # Export results to JSON
-    $0 --output-json audit-results.json
-
-    # Only show high and critical vulnerabilities
-    $0 --severity high
-
-    # Verbose mode with specific profile
-    $0 --profile staging --v
-
-    # Diagnostic mode for troubleshooting
-    $0 --diagnostic --v
-
+    $0 --profile prod --region us-east-1 --v
+    $0 --mode download --profile prod
+    $0 --mode auditLocal
 EOF
 }
 
 log_info() {
-    echo -e "${CYAN}ℹ ${RESET}$*"
+    echo -e "${CYAN}ℹ${RESET} $*"
 }
 
 log_success() {
     echo -e "${GREEN}✓${RESET} $*"
 }
 
-log_warning() {
-    echo -e "${YELLOW}⚠${RESET} $*"
-}
-
 log_error() {
     echo -e "${RED}✗${RESET} $*"
-}
-
-log_verbose() {
-    if [[ "$VERBOSE" == true ]]; then
-        echo -e "${BLUE}→${RESET} $*"
-    fi
 }
 
 log_section() {
@@ -128,509 +91,584 @@ log_section() {
     echo
 }
 
-# ====== Initialization ======
-init() {
-    log_section "Lambda Python Audit - Initialization"
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --profile)
+            PROFILE="$2"
+            shift 2
+            ;;
+        --region)
+            REGION="$2"
+            shift 2
+            ;;
+        --mode)
+            MODE="$2"
+            if [[ "$MODE" != "audit" ]] && [[ "$MODE" != "download" ]] && [[ "$MODE" != "auditLocal" ]]; then
+                log_error "Invalid mode: $MODE. Must be 'audit', 'download', or 'auditLocal'"
+                show_help
+                exit 1
+            fi
+            shift 2
+            ;;
+        --v|--verbose)
+            VERBOSE=true
+            shift
+            ;;
+        --help|-h)
+            show_help
+            exit 0
+            ;;
+        *)
+            log_error "Unknown option: $1"
+            show_help
+            exit 1
+            ;;
+    esac
+done
 
-    # Check required commands
-    local missing_deps=()
-    for cmd in aws jq unzip curl python3 pip; do
+log_section "Lambda Python Security Audit - Initialization"
+
+# Check dependencies based on mode
+log_info "Checking required dependencies..."
+MISSING_DEPS=()
+
+if [[ "$MODE" == "auditLocal" ]]; then
+    # auditLocal mode only needs pip-audit and jq
+    for cmd in jq pip-audit; do
         if ! command -v $cmd >/dev/null 2>&1; then
-            missing_deps+=("$cmd")
+            MISSING_DEPS+=("$cmd")
         fi
     done
+else
+    # audit and download modes need all dependencies
+    for cmd in aws jq unzip pip-audit curl; do
+        if ! command -v $cmd >/dev/null 2>&1; then
+            MISSING_DEPS+=("$cmd")
+        fi
+    done
+fi
 
-    # Check for pip-audit
-    if ! python3 -m pip show pip-audit >/dev/null 2>&1; then
-        missing_deps+=("pip-audit")
+if [[ ${#MISSING_DEPS[@]} -gt 0 ]]; then
+    log_error "Missing required dependencies: ${MISSING_DEPS[*]}"
+    echo "Please install the missing dependencies and try again."
+    echo ""
+    echo "To install pip-audit:"
+    echo "  pip install pip-audit"
+    echo "  or"
+    echo "  pipx install pip-audit"
+    exit 1
+fi
+
+if [[ "$MODE" == "auditLocal" ]]; then
+    log_success "All dependencies found (jq, pip-audit)"
+else
+    log_success "All dependencies found (aws, jq, unzip, pip-audit, curl)"
+fi
+
+# Build AWS CLI options
+AWS_OPTS=""
+[[ -n "$PROFILE" ]] && AWS_OPTS="$AWS_OPTS --profile $PROFILE"
+[[ -n "$REGION" ]] && AWS_OPTS="$AWS_OPTS --region $REGION"
+
+# Verify AWS authentication (skip for auditLocal mode)
+if [[ "$MODE" != "auditLocal" ]]; then
+    log_info "Verifying AWS authentication..."
+    if [[ -n "$PROFILE" ]]; then
+        echo -e "  ${BOLD}Profile:${RESET} $PROFILE"
+    else
+        echo -e "  ${BOLD}Profile:${RESET} default"
     fi
 
-    if [[ ${#missing_deps[@]} -gt 0 ]]; then
-        log_error "Missing required dependencies: ${missing_deps[*]}"
-        echo "Please install the missing dependencies:"
-        echo "  pip3 install pip-audit"
+    # Test AWS credentials
+    if ! AWS_IDENTITY=$(aws sts get-caller-identity $AWS_OPTS --output json 2>&1); then
+        log_error "AWS authentication failed"
+        echo
+        echo "Error details:"
+        echo "$AWS_IDENTITY"
+        echo
+        if [[ -n "$PROFILE" ]]; then
+            echo "Please verify:"
+            echo "  1. Profile '$PROFILE' exists in ~/.aws/credentials or ~/.aws/config"
+            echo "  2. Profile has valid credentials"
+            echo "  3. You have network connectivity to AWS"
+        else
+            echo "Please verify:"
+            echo "  1. AWS credentials are configured (run 'aws configure')"
+            echo "  2. You have network connectivity to AWS"
+        fi
         exit 1
     fi
 
-    log_success "All dependencies found"
-
-    # Parse script options
-    while [[ $# -gt 0 ]]; do
-        case $1 in
-            --profile)
-                PROFILE="$2"
-                shift 2
-                ;;
-            --region)
-                REGION="$2"
-                shift 2
-                ;;
-            --output-json)
-                OUTPUT_JSON="$2"
-                shift 2
-                ;;
-            --severity)
-                MIN_SEVERITY="$2"
-                shift 2
-                ;;
-            --diagnostic)
-                DIAGNOSTIC=true
-                shift
-                ;;
-            --v|--verbose)
-                VERBOSE=true
-                shift
-                ;;
-            --help|-h)
-                show_help
-                exit 0
-                ;;
-            *)
-                log_error "Unknown option: $1"
-                show_help
-                exit 1
-                ;;
-        esac
-    done
-
-    # Build AWS CLI options
-    local AWS_OPTS=""
-    [[ -n "$PROFILE" ]] && AWS_OPTS="$AWS_OPTS --profile $PROFILE"
-    [[ -n "$REGION" ]] && AWS_OPTS="$AWS_OPTS --region $REGION"
-
-    # Get current AWS context
-    local ACCOUNT_ID=$(aws sts get-caller-identity $AWS_OPTS --query 'Account' --output text 2>/dev/null || echo "unknown")
-    local CURRENT_REGION=$(aws configure get region $([[ -n "$PROFILE" ]] && echo "--profile $PROFILE") 2>/dev/null || echo "us-east-1")
+    # Display authentication info
+    ACCOUNT_ID=$(echo "$AWS_IDENTITY" | jq -r '.Account')
+    USER_ARN=$(echo "$AWS_IDENTITY" | jq -r '.Arn')
+    CURRENT_REGION=$(aws configure get region $([[ -n "$PROFILE" ]] && echo "--profile $PROFILE") 2>/dev/null || echo "us-east-1")
     [[ -n "$REGION" ]] && CURRENT_REGION="$REGION"
 
-    log_info "AWS Account: ${BOLD}${ACCOUNT_ID}${RESET}"
-    log_info "AWS Region: ${BOLD}${CURRENT_REGION}${RESET}"
-    [[ -n "$PROFILE" ]] && log_info "AWS Profile: ${BOLD}${PROFILE}${RESET}"
+    log_success "AWS authentication successful"
+    echo -e "  ${BOLD}Account ID:${RESET} $ACCOUNT_ID"
+    echo -e "  ${BOLD}Identity:${RESET} $USER_ARN"
+    echo -e "  ${BOLD}Region:${RESET} $CURRENT_REGION"
+fi
 
-    # Prepare temp directory
-    rm -rf "$TMP_DIR"
+log_section "Lambda Python Security Audit"
+
+# Mode-specific setup
+if [[ "$MODE" == "auditLocal" ]]; then
+    log_info "Mode: Audit Local - Processing Lambda functions in current directory"
+    TMP_DIR="."
+    
+    # Check if there are any zip files in current directory
+    ZIP_COUNT=$(ls -1 *.zip 2>/dev/null | wc -l | tr -d ' ')
+    if [[ $ZIP_COUNT -eq 0 ]]; then
+        log_error "No Lambda function zip files found in current directory"
+        echo "Please ensure you have Lambda function zip files in the current directory"
+        exit 1
+    fi
+    
+    log_success "Found $ZIP_COUNT Lambda function zip file(s) to audit"
+    
+else
+    # Step 1: Create temp directory and cd into it
+    TMP_DIR="./lambda_audit_python_$(date +%s)"
     mkdir -p "$TMP_DIR"
-    log_success "Temporary directory created: $TMP_DIR"
-}
+    cd "$TMP_DIR"
+    log_success "Created temp directory: $TMP_DIR"
+fi
 
-# ====== Parse pip-audit JSON output ======
-parse_audit_results() {
-    local AUDIT_JSON=$1
-    local NAME=$2
-    local TYPE=$3  # "function" or "layer"
-
-    if [[ ! -f "$AUDIT_JSON" ]]; then
-        log_verbose "No audit results file found for $NAME"
-        return
-    fi
-
-    # pip-audit uses different severity levels: low, medium, high, critical
-    local CRITICAL=$(jq -r '[.dependencies[].vulns[] | select(.fix_versions != null and .severity == "critical")] | length' "$AUDIT_JSON" 2>/dev/null || echo 0)
-    local HIGH=$(jq -r '[.dependencies[].vulns[] | select(.fix_versions != null and .severity == "high")] | length' "$AUDIT_JSON" 2>/dev/null || echo 0)
-    local MEDIUM=$(jq -r '[.dependencies[].vulns[] | select(.fix_versions != null and .severity == "medium")] | length' "$AUDIT_JSON" 2>/dev/null || echo 0)
-    local LOW=$(jq -r '[.dependencies[].vulns[] | select(.fix_versions != null and .severity == "low")] | length' "$AUDIT_JSON" 2>/dev/null || echo 0)
-    local TOTAL=$((CRITICAL + HIGH + MEDIUM + LOW))
-
-    # Update global counters
-    TOTAL_CRITICAL=$((TOTAL_CRITICAL + CRITICAL))
-    TOTAL_HIGH=$((TOTAL_HIGH + HIGH))
-    TOTAL_MEDIUM=$((TOTAL_MEDIUM + MEDIUM))
-    TOTAL_LOW=$((TOTAL_LOW + LOW))
-
-    # Store result
-    AUDIT_RESULTS+=("$TYPE|$NAME|$CRITICAL|$HIGH|$MEDIUM|$LOW|$TOTAL")
-
-    # Display summary
-    if [[ $TOTAL -gt 0 ]]; then
-        local severity_display=""
-        [[ $CRITICAL -gt 0 ]] && severity_display="${severity_display}${RED}Critical: $CRITICAL${RESET} "
-        [[ $HIGH -gt 0 ]] && severity_display="${severity_display}${MAGENTA}High: $HIGH${RESET} "
-        [[ $MEDIUM -gt 0 ]] && severity_display="${severity_display}${YELLOW}Medium: $MEDIUM${RESET} "
-        [[ $LOW -gt 0 ]] && severity_display="${severity_display}${BLUE}Low: $LOW${RESET} "
-
-        echo -e "  ${BOLD}Vulnerabilities:${RESET} $severity_display(Total: $TOTAL)"
+# Cleanup on exit
+cleanup() {
+    if [[ "$MODE" == "auditLocal" ]]; then
+        # For auditLocal mode, only clean up unzipped directories
+        if [[ -n "$TMP_DIR" ]] && [[ -d "$TMP_DIR" ]]; then
+            find "$TMP_DIR" -type d -mindepth 1 -maxdepth 1 -not -name "*auditResults.json" -exec rm -rf {} + 2>/dev/null || true
+            log_info "Cleaned up unzipped directories (kept zip files and audit results)"
+        fi
+    elif [[ "$MODE" == "download" ]]; then
+        # For download mode, don't clean up anything
+        log_info "Download mode: Keeping all downloaded files"
     else
-        log_success "  No vulnerabilities found"
+        # For audit mode, clean up as usual
+        if [[ -n "$TMP_DIR" ]] && [[ -d "$TMP_DIR" ]]; then
+            cd ..
+            # Remove zip files and unzipped directories, keep result files
+            find "$TMP_DIR" -name "*.zip" -delete 2>/dev/null || true
+            find "$TMP_DIR" -type d -mindepth 1 -exec rm -rf {} + 2>/dev/null || true
+            log_info "Cleaned up zip files and directories (kept audit results)"
+        fi
     fi
 }
+trap cleanup EXIT
 
-# ====== Audit a Lambda package ======
-audit_package() {
-    local NAME=$1
-    local ZIP_URL=$2
-    local TYPE=$3  # "function" or "layer"
+# Step 2: Download only Python Lambda functions (skip for auditLocal mode)
+if [[ "$MODE" != "auditLocal" ]]; then
+    log_info "Fetching Python Lambda functions..."
 
-    local FUNC_DIR="$TMP_DIR/$NAME"
-    rm -rf "$FUNC_DIR"
-    mkdir -p "$FUNC_DIR"
-    
-    # Get absolute path for FUNC_DIR to avoid issues with pushd
-    local FUNC_DIR_ABS="$(cd "$FUNC_DIR" && pwd)"
-    
-    log_verbose "Downloading $TYPE: $NAME"
-    
-    if ! curl -sL -o "$FUNC_DIR/code.zip" "$ZIP_URL" 2>/dev/null; then
-        log_error "Failed to download $TYPE: $NAME"
-        return 1
+    # Get list of Python functions with their runtimes
+    FUNCTIONS_JSON=$(aws lambda list-functions $AWS_OPTS --query 'Functions[?starts_with(Runtime, `python`)].[FunctionName, Runtime]' --output json)
+    FUNC_COUNT=$(echo "$FUNCTIONS_JSON" | jq -r '. | length')
+
+    if [[ $FUNC_COUNT -eq 0 ]]; then
+        log_error "No Python Lambda functions found"
+        exit 0
     fi
 
-    pushd "$FUNC_DIR" >/dev/null
-
-    if ! unzip -oq code.zip 2>/dev/null; then
-        log_error "Failed to extract $TYPE: $NAME"
-        popd >/dev/null
-        return 1
-    fi
-
-    local found=false
-    
-    # Look for requirements.txt files
-    while IFS= read -r req_file; do
-        found=true
-        local DIR=$(dirname "$req_file")
-        
-        log_verbose "Running pip-audit in: $DIR"
-        
-        # Generate safe filename from directory path
-        local DIR_SAFE=$(echo "$DIR" | tr '/' '_' | sed 's/^_*//' | sed 's/_*$//')
-        [[ -z "$DIR_SAFE" || "$DIR_SAFE" == "." ]] && DIR_SAFE="root"
-        local AUDIT_OUTPUT="$FUNC_DIR_ABS/audit_${DIR_SAFE}.json"
-        
-        pushd "$DIR" >/dev/null
-
-        # Check Python version
-        local PY_VERSION=$(python3 --version 2>&1 | awk '{print $2}')
-        log_verbose "Python version: $PY_VERSION"
-
-        # Run pip-audit
-        local AUDIT_FAILED=false
-        
-        log_verbose "Attempting pip-audit -r requirements.txt..."
-        
-        # Try pip-audit with JSON output
-        if python3 -m pip_audit -r requirements.txt --format json > "$AUDIT_OUTPUT" 2>&1; then
-            log_verbose "Audit completed successfully"
-        else
-            AUDIT_FAILED=true
-            log_verbose "Audit failed, trying with --no-deps..."
-            # Try without checking dependencies
-            if python3 -m pip_audit -r requirements.txt --format json --no-deps > "$AUDIT_OUTPUT" 2>&1; then
-                log_verbose "Audit completed (no-deps mode)"
-            else
-                log_verbose "Audit failed, creating empty result..."
-                echo '{"dependencies":[]}' > "$AUDIT_OUTPUT"
-            fi
-        fi
-
-        # Check if audit output is valid JSON
-        if [[ ! -s "$AUDIT_OUTPUT" ]]; then
-            log_warning "Audit output file is empty for $DIR"
-            echo '{"dependencies":[]}' > "$AUDIT_OUTPUT"
-        elif ! jq empty "$AUDIT_OUTPUT" 2>/dev/null; then
-            log_warning "Invalid JSON in audit results for $DIR"
-            if [[ "$VERBOSE" == true ]]; then
-                log_verbose "Content: $(head -20 "$AUDIT_OUTPUT")"
-            fi
-            echo '{"dependencies":[]}' > "$AUDIT_OUTPUT"
-        fi
-
-        # Display requirements.txt info for debugging
-        if [[ "$VERBOSE" == true ]] && [[ -f requirements.txt ]]; then
-            log_verbose "Packages in requirements.txt:"
-            head -10 requirements.txt | while read line; do
-                [[ -n "$line" ]] && log_verbose "  - $line"
-            done
-        fi
-
-        # Diagnostic mode - show raw audit output
-        if [[ "$DIAGNOSTIC" == true ]]; then
-            echo -e "${YELLOW}=== DIAGNOSTIC: Raw pip-audit output ===${RESET}"
-            cat "$AUDIT_OUTPUT" | jq '.'
-            echo -e "${YELLOW}=== DIAGNOSTIC: requirements.txt ===${RESET}"
-            cat requirements.txt || echo "(no requirements.txt)"
-            echo -e "${YELLOW}=== DIAGNOSTIC: Installed packages ===${RESET}"
-            python3 -m pip list 2>/dev/null | head -20 || true
-            echo -e "${YELLOW}=== END DIAGNOSTIC ===${RESET}"
-        fi
-
-        # Parse and display results
-        parse_audit_results "$AUDIT_OUTPUT" "$NAME ($(basename $DIR))" "$TYPE"
-
-        popd >/dev/null
-    done < <(find . -name "requirements.txt" -not -path "*/site-packages/*" -not -path "*/.venv/*")
-
-    # Also check for Poetry/Pipenv
-    if [[ -f "pyproject.toml" ]] || [[ -f "Pipfile" ]]; then
-        log_verbose "Found pyproject.toml or Pipfile - attempting audit..."
-        
-        local AUDIT_OUTPUT="$FUNC_DIR_ABS/audit_poetry.json"
-        
-        # Try to audit using pip-audit's automatic detection
-        if python3 -m pip_audit --format json > "$AUDIT_OUTPUT" 2>&1; then
-            found=true
-            parse_audit_results "$AUDIT_OUTPUT" "$NAME (poetry/pipenv)" "$TYPE"
-        fi
-    fi
-
-    if [[ "$found" == false ]]; then
-        log_warning "No requirements.txt, pyproject.toml, or Pipfile found in $TYPE: $NAME"
-    fi
-
-    popd >/dev/null
-}
-
-# ====== Process Lambda Functions ======
-process_functions() {
-    log_section "Auditing Lambda Functions"
-
-    local AWS_OPTS=""
-    [[ -n "$PROFILE" ]] && AWS_OPTS="$AWS_OPTS --profile $PROFILE"
-    [[ -n "$REGION" ]] && AWS_OPTS="$AWS_OPTS --region $REGION"
-
-    log_info "Listing Lambda functions..."
-
-    local FUNCTION_LIST
-    FUNCTION_LIST=$(aws lambda list-functions $AWS_OPTS --query 'Functions[].FunctionName' --output json 2>/dev/null | jq -r '.[]' || echo "")
-
-    if [[ -z "$FUNCTION_LIST" ]]; then
-        log_warning "No Lambda functions found"
-        return
-    fi
-
-    local TOTAL_FUNCS=$(echo "$FUNCTION_LIST" | wc -l | tr -d ' ')
-    log_info "Found $TOTAL_FUNCS Lambda function(s)"
+    log_success "Found $FUNC_COUNT Python Lambda function(s)"
     echo
 
-    while IFS= read -r FUNC; do
-        [[ -z "$FUNC" ]] && continue
-
-        echo -e "${BOLD}${CYAN}► Lambda Function:${RESET} ${BOLD}$FUNC${RESET}"
-
-        local FUNC_INFO
-        FUNC_INFO=$(aws lambda get-function $AWS_OPTS --function-name "$FUNC" --output json 2>/dev/null)
-
-        local RUNTIME=$(echo "$FUNC_INFO" | jq -r '.Configuration.Runtime')
-        echo -e "  Runtime: $RUNTIME"
-
-        if [[ ! "$RUNTIME" =~ ^python ]]; then
-            log_warning "  Skipping non-Python runtime"
-            NON_PYTHON_COUNT=$((NON_PYTHON_COUNT + 1))
-            echo
-            continue
-        fi
-
-        PYTHON_COUNT=$((PYTHON_COUNT + 1))
-
-        local FUNC_URL=$(echo "$FUNC_INFO" | jq -r '.Code.Location')
-        if [[ -n "$FUNC_URL" ]]; then
-            audit_package "$FUNC" "$FUNC_URL" "function"
-        else
-            log_error "  Could not retrieve function code location"
-        fi
-
-        # Collect layers for second pass
-        local LAYERS=$(echo "$FUNC_INFO" | jq -r '.Configuration.Layers[]?.Arn // empty' 2>/dev/null)
-        if [[ -n "$LAYERS" ]]; then
-            echo -e "  ${BOLD}Layers:${RESET}"
-            while IFS= read -r LAYER_ARN; do
-                [[ -z "$LAYER_ARN" ]] && continue
-                local LAYER_NAME=$(echo "$LAYER_ARN" | awk -F: '{print $(NF-1)}')
-                local LAYER_VERSION=$(echo "$LAYER_ARN" | awk -F: '{print $NF}')
-                echo -e "    - $LAYER_NAME:$LAYER_VERSION"
-                LAYERS_TO_PROCESS["$LAYER_NAME:$LAYER_VERSION"]="$LAYER_ARN"
-            done <<< "$LAYERS"
-        fi
-
-        echo
-    done <<< "$FUNCTION_LIST"
-
-    # Summary after functions
-    log_section "Functions Audit Summary"
-    log_success "Python Lambdas audited: ${BOLD}$PYTHON_COUNT${RESET}"
-    [[ $NON_PYTHON_COUNT -gt 0 ]] && log_info "Non-Python Lambdas skipped: $NON_PYTHON_COUNT"
-}
-
-# ====== Process Lambda Layers ======
-process_layers() {
-    if [[ ${#LAYERS_TO_PROCESS[@]} -eq 0 ]]; then
-        log_info "No Lambda layers to audit"
-        return
-    fi
-
-    log_section "Auditing Lambda Layers"
-
-    local AWS_OPTS=""
-    [[ -n "$PROFILE" ]] && AWS_OPTS="$AWS_OPTS --profile $PROFILE"
-    [[ -n "$REGION" ]] && AWS_OPTS="$AWS_OPTS --region $REGION"
-
-    log_info "Found ${#LAYERS_TO_PROCESS[@]} unique layer(s) to audit"
+    # Display table of functions to download
+    echo -e "${BOLD}Python Lambda Functions:${RESET}"
+    echo "$FUNCTIONS_JSON" | jq -r '.[] | "  - \(.[0]) (\(.[1]))"'
     echo
 
-    for key in "${!LAYERS_TO_PROCESS[@]}"; do
-        local LAYER_NAME="${key%%:*}"
-        local LAYER_VERSION="${key##*:}"
-
-        echo -e "${BOLD}${CYAN}► Lambda Layer:${RESET} ${BOLD}$LAYER_NAME${RESET} (v${LAYER_VERSION})"
-
-        local LAYER_INFO
-        LAYER_INFO=$(aws lambda get-layer-version $AWS_OPTS --layer-name "$LAYER_NAME" --version-number "$LAYER_VERSION" --output json 2>/dev/null || echo "")
-
-        if [[ -z "$LAYER_INFO" ]]; then
-            log_error "  Failed to retrieve layer information"
-            echo
+    # Download all Python functions
+    echo "$FUNCTIONS_JSON" | jq -r '.[][0]' | while read -r FUNC_NAME; do
+        log_info "Downloading: $FUNC_NAME"
+        
+        # Get function code location
+        if ! CODE_URL=$(aws lambda get-function $AWS_OPTS --function-name "$FUNC_NAME" --query 'Code.Location' --output text 2>&1); then
+            log_error "Failed to get code URL for $FUNC_NAME: $CODE_URL"
             continue
         fi
-
-        local LAYER_URL=$(echo "$LAYER_INFO" | jq -r '.Content.Location // empty')
-        if [[ -n "$LAYER_URL" ]]; then
-            audit_package "layer_${LAYER_NAME}_v${LAYER_VERSION}" "$LAYER_URL" "layer"
-            LAYER_COUNT=$((LAYER_COUNT + 1))
-        else
-            log_error "  Could not retrieve layer code location"
+        
+        if [[ -z "$CODE_URL" ]] || [[ "$CODE_URL" == "None" ]]; then
+            log_error "No code URL available for $FUNC_NAME"
+            continue
         fi
-
-        echo
+        
+        # Download zip file with retries
+        RETRY_COUNT=0
+        MAX_RETRIES=3
+        DOWNLOAD_SUCCESS=false
+        
+        while [[ $RETRY_COUNT -lt $MAX_RETRIES ]]; do
+            if curl -sL -f -o "${FUNC_NAME}.zip" "$CODE_URL" 2>/dev/null; then
+                DOWNLOAD_SUCCESS=true
+                break
+            fi
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+            [[ $RETRY_COUNT -lt $MAX_RETRIES ]] && sleep 2
+        done
+        
+        if [[ "$DOWNLOAD_SUCCESS" == true ]]; then
+            log_success "Downloaded: ${FUNC_NAME}.zip"
+        else
+            log_error "Failed to download after $MAX_RETRIES attempts: $FUNC_NAME"
+        fi
     done
 
-    log_section "Layers Audit Summary"
-    log_success "Layers audited: ${BOLD}$LAYER_COUNT${RESET}"
-}
-
-# ====== Generate Final Report ======
-generate_report() {
-    log_section "Final Audit Report"
-
-    echo -e "${BOLD}Scan Summary:${RESET}"
-    echo -e "  Lambda Functions (Python): ${GREEN}$PYTHON_COUNT${RESET}"
-    [[ $NON_PYTHON_COUNT -gt 0 ]] && echo -e "  Lambda Functions (Other): $NON_PYTHON_COUNT"
-    echo -e "  Lambda Layers: ${GREEN}$LAYER_COUNT${RESET}"
     echo
+    
+    # If download mode, exit here
+    if [[ "$MODE" == "download" ]]; then
+        log_section "Download Complete"
+        log_success "All Lambda functions downloaded to: $(pwd)"
+        exit 0
+    fi
+    
+    log_section "Processing Lambda Functions"
+fi
 
-    echo -e "${BOLD}Total Vulnerabilities Found:${RESET}"
-    [[ $TOTAL_CRITICAL -gt 0 ]] && echo -e "  ${RED}${BOLD}Critical:${RESET} $TOTAL_CRITICAL"
-    [[ $TOTAL_HIGH -gt 0 ]] && echo -e "  ${MAGENTA}High:${RESET} $TOTAL_HIGH"
-    [[ $TOTAL_MEDIUM -gt 0 ]] && echo -e "  ${YELLOW}Medium:${RESET} $TOTAL_MEDIUM"
-    [[ $TOTAL_LOW -gt 0 ]] && echo -e "  ${BLUE}Low:${RESET} $TOTAL_LOW"
+# Step 3 & 4: Unzip and audit each function
+for ZIP_FILE in *.zip; do
+    [[ ! -f "$ZIP_FILE" ]] && continue
+    
+    FUNC_NAME="${ZIP_FILE%.zip}"
+    FUNC_DIR="$FUNC_NAME"
+    
+    # Add function name to array
+    FUNCTION_NAMES+=("$FUNC_NAME")
+    
+    # Initialize counters for this function
+    FUNCTION_RESULTS["$FUNC_NAME"]="0|0|0|0|0"
+    
+    echo -e "${BOLD}Processing: $FUNC_NAME${RESET}"
+    
+    # Unzip into its own directory
+    mkdir -p "$FUNC_DIR"
+    if ! unzip -q "$ZIP_FILE" -d "$FUNC_DIR" 2>/dev/null; then
+        log_error "Failed to unzip: $ZIP_FILE"
+        continue
+    fi
+    
+    # Strategy: Look for Python package directories
+    # 1. Find requirements.txt files
+    # 2. Find site-packages directories
+    # 3. Find directories with .dist-info (installed packages)
+    # 4. If nothing found, scan the entire function directory
+    
+    REQUIREMENTS_FILES=$(find "$FUNC_DIR" -type f -name "requirements.txt" 2>/dev/null || true)
+    SITE_PACKAGES_DIRS=$(find "$FUNC_DIR" -type d -name "site-packages" 2>/dev/null || true)
+    DIST_INFO_DIRS=$(find "$FUNC_DIR" -type d -name "*.dist-info" 2>/dev/null | head -1 || true)
+    
+    # Combine into audit targets
+    AUDIT_TARGETS=""
+    
+    if [[ -n "$REQUIREMENTS_FILES" ]]; then
+        AUDIT_TARGETS="$REQUIREMENTS_FILES"
+    fi
+    
+    if [[ -n "$SITE_PACKAGES_DIRS" ]]; then
+        if [[ -n "$AUDIT_TARGETS" ]]; then
+            AUDIT_TARGETS="$AUDIT_TARGETS"$'\n'"$SITE_PACKAGES_DIRS"
+        else
+            AUDIT_TARGETS="$SITE_PACKAGES_DIRS"
+        fi
+    fi
+    
+    # If we found .dist-info but no site-packages, scan parent directory
+    if [[ -z "$AUDIT_TARGETS" ]] && [[ -n "$DIST_INFO_DIRS" ]]; then
+        PARENT_DIR=$(dirname "$DIST_INFO_DIRS")
+        log_info "Found .dist-info in $PARENT_DIR, will scan that directory"
+        AUDIT_TARGETS="$PARENT_DIR|path"
+    fi
+    
+    # If nothing found, scan the entire function directory
+    if [[ -z "$AUDIT_TARGETS" ]]; then
+        log_info "No standard package structure found, scanning entire function directory"
+        AUDIT_TARGETS="$FUNC_DIR|path"
+    fi
+    
+    # Count how many targets found
+    TARGET_COUNT=$(echo "$AUDIT_TARGETS" | wc -l | tr -d ' ')
+    log_info "Found $TARGET_COUNT audit target(s)"
+    
+    # Run pip-audit for each target found
+    TARGET_NUM=0
+    while IFS= read -r TARGET_PATH; do
+        [[ -z "$TARGET_PATH" ]] && continue
+        
+        TARGET_NUM=$((TARGET_NUM + 1))
+        
+        # Check if this is a special path-based target
+        if [[ "$TARGET_PATH" == *"|path" ]]; then
+            TARGET_PATH="${TARGET_PATH%|path}"
+            TARGET_TYPE="directory"
+            TARGET_DIR="$TARGET_PATH"
+            TARGET_NAME="$(basename "$TARGET_PATH")"
+        elif [[ -f "$TARGET_PATH" ]]; then
+            TARGET_TYPE="requirements"
+            TARGET_DIR=$(dirname "$TARGET_PATH")
+            TARGET_NAME=$(basename "$TARGET_PATH")
+        else
+            TARGET_TYPE="site-packages"
+            TARGET_DIR="$TARGET_PATH"
+            TARGET_NAME="site-packages"
+        fi
+        
+        # Get the absolute path
+        TARGET_DIR_ABS=$(cd "$TARGET_DIR" && pwd)
+        
+        # Create a unique identifier for this target location
+        FUNC_DIR_ABS=$(cd "$FUNC_DIR" && pwd)
+        TARGET_SUBPATH=$(echo "$TARGET_DIR_ABS" | sed "s|^${FUNC_DIR_ABS}||" | sed 's|^/||' | tr '/' '_')
+        [[ -z "$TARGET_SUBPATH" ]] && TARGET_SUBPATH="root"
+        TARGET_SUBPATH="${TARGET_SUBPATH}_${TARGET_NAME}"
+        
+        log_info "Auditing [$TARGET_NUM/$TARGET_COUNT]: $TARGET_SUBPATH ($TARGET_TYPE)"
+        
+        # Get absolute path for audit file with unique name for each target
+        AUDIT_FILE="$(pwd)/${FUNC_NAME}-${TARGET_SUBPATH}-auditResults.json"
+        
+        # Run the audit in a subshell
+        (
+            cd "$TARGET_DIR_ABS" || exit 0
+            
+            # Run pip-audit based on target type
+            if [[ "$TARGET_TYPE" == "requirements" ]]; then
+                if [[ ! -f "$TARGET_NAME" ]]; then
+                    log_error "  $TARGET_NAME not found"
+                    exit 0
+                fi
+                
+                if [[ "$VERBOSE" == true ]]; then
+                    pip-audit -r "$TARGET_NAME" --format json 2>&1 | tee "$AUDIT_FILE" || true
+                else
+                    pip-audit -r "$TARGET_NAME" --format json > "$AUDIT_FILE" 2>&1 || true
+                fi
+            elif [[ "$TARGET_TYPE" == "directory" ]]; then
+                # Generate a temporary requirements.txt from .dist-info directories
+                log_info "  Generating requirements from installed packages..."
+                
+                TEMP_REQ="$(mktemp)"
+                
+                # Find all .dist-info directories and extract package names/versions
+                # Use process substitution to avoid subshell issues
+                while read -r dist_info; do
+                    METADATA_FILE="$dist_info/METADATA"
+                    if [[ -f "$METADATA_FILE" ]]; then
+                        # Extract Name and Version from METADATA
+                        PKG_NAME=$(grep "^Name:" "$METADATA_FILE" | head -1 | cut -d' ' -f2- | tr -d '[:space:]')
+                        PKG_VERSION=$(grep "^Version:" "$METADATA_FILE" | head -1 | cut -d' ' -f2- | tr -d '[:space:]')
+                        
+                        if [[ -n "$PKG_NAME" ]] && [[ -n "$PKG_VERSION" ]]; then
+                            echo "${PKG_NAME}==${PKG_VERSION}" >> "$TEMP_REQ"
+                        fi
+                    fi
+                done < <(find . -type d -name "*.dist-info" 2>/dev/null)
+                
+                # Check if we found any packages
+                if [[ -s "$TEMP_REQ" ]]; then
+                    PKG_COUNT=$(wc -l < "$TEMP_REQ" | tr -d ' ')
+                    log_info "  Found $PKG_COUNT package(s) to audit"
+                    
+                    if [[ "$VERBOSE" == true ]]; then
+                        echo "  Packages found:"
+                        cat "$TEMP_REQ" | sed 's/^/    /'
+                        pip-audit -r "$TEMP_REQ" --format json 2>&1 | tee "$AUDIT_FILE" || true
+                    else
+                        pip-audit -r "$TEMP_REQ" --format json > "$AUDIT_FILE" 2>&1 || true
+                    fi
+                else
+                    log_error "  No packages found in directory"
+                    echo '{"dependencies":[]}' > "$AUDIT_FILE"
+                fi
+                
+                rm -f "$TEMP_REQ"
+            else
+                # site-packages directory
+                if [[ "$VERBOSE" == true ]]; then
+                    pip-audit --format json 2>&1 | tee "$AUDIT_FILE" || true
+                else
+                    pip-audit --format json > "$AUDIT_FILE" 2>&1 || true
+                fi
+            fi
+            
+            # Parse results
+            if [[ -s "$AUDIT_FILE" ]] && jq empty "$AUDIT_FILE" 2>/dev/null; then
+                TOTAL=$(jq -r '.dependencies // [] | length' "$AUDIT_FILE" 2>/dev/null || echo 0)
+                
+                CRITICAL=0
+                HIGH=0
+                MODERATE=0
+                LOW=0
+                INFO=0
+                
+                if [[ $TOTAL -gt 0 ]]; then
+                    while read -r vuln; do
+                        MODERATE=$((MODERATE + 1))
+                    done < <(jq -c '.dependencies[]?' "$AUDIT_FILE" 2>/dev/null || echo "[]")
+                    
+                    echo -e "  ${YELLOW}Vulnerabilities found: $TOTAL${RESET}"
+                else
+                    log_success "  No vulnerabilities found"
+                fi
+                
+                jq -n \
+                    --arg total "$TOTAL" \
+                    --arg critical "$CRITICAL" \
+                    --arg high "$HIGH" \
+                    --arg moderate "$MODERATE" \
+                    --arg low "$LOW" \
+                    --arg info "$INFO" \
+                    '{metadata: {vulnerabilities: {critical: ($critical|tonumber), high: ($high|tonumber), moderate: ($moderate|tonumber), low: ($low|tonumber), info: ($info|tonumber), total: ($total|tonumber)}}}' \
+                    > "${AUDIT_FILE}.summary" 2>/dev/null || true
+            else
+                log_error "  Failed to generate valid audit results"
+                echo '{"metadata":{"vulnerabilities":{"critical":0,"high":0,"moderate":0,"low":0,"info":0,"total":0},"error":"invalid_audit_output"}}' > "${AUDIT_FILE}.summary" 2>/dev/null || true
+            fi
+        ) || {
+            log_error "  Audit failed, continuing..."
+            echo '{"metadata":{"vulnerabilities":{"critical":0,"high":0,"moderate":0,"low":0,"info":0,"total":0},"error":"audit_failed"}}' > "${AUDIT_FILE}.summary" 2>/dev/null || true
+        }
+    done <<< "$AUDIT_TARGETS"
+    
+    echo
+done
 
-    local GRAND_TOTAL=$((TOTAL_CRITICAL + TOTAL_HIGH + TOTAL_MEDIUM + TOTAL_LOW))
+# Aggregate results per function after all functions have been processed
+log_section "Aggregating Results"
+
+# Process each function we tracked
+for FUNC_NAME in "${FUNCTION_NAMES[@]}"; do
+    FUNC_CRITICAL=0
+    FUNC_HIGH=0
+    FUNC_MODERATE=0
+    FUNC_LOW=0
+    FUNC_INFO=0
+    
+    # Find all audit result summary files for this function
+    for RESULT_FILE in "${FUNC_NAME}"-*-auditResults.json.summary; do
+        [[ ! -f "$RESULT_FILE" ]] && continue
+        
+        if jq empty "$RESULT_FILE" 2>/dev/null; then
+            FUNC_CRITICAL=$((FUNC_CRITICAL + $(jq -r '.metadata.vulnerabilities.critical // 0' "$RESULT_FILE" 2>/dev/null || echo 0)))
+            FUNC_HIGH=$((FUNC_HIGH + $(jq -r '.metadata.vulnerabilities.high // 0' "$RESULT_FILE" 2>/dev/null || echo 0)))
+            FUNC_MODERATE=$((FUNC_MODERATE + $(jq -r '.metadata.vulnerabilities.moderate // 0' "$RESULT_FILE" 2>/dev/null || echo 0)))
+            FUNC_LOW=$((FUNC_LOW + $(jq -r '.metadata.vulnerabilities.low // 0' "$RESULT_FILE" 2>/dev/null || echo 0)))
+            FUNC_INFO=$((FUNC_INFO + $(jq -r '.metadata.vulnerabilities.info // 0' "$RESULT_FILE" 2>/dev/null || echo 0)))
+        fi
+    done
+    
+    # Store function totals
+    FUNCTION_RESULTS["$FUNC_NAME"]="$FUNC_CRITICAL|$FUNC_HIGH|$FUNC_MODERATE|$FUNC_LOW|$FUNC_INFO"
+    
+    # Update global totals
+    TOTAL_CRITICAL=$((TOTAL_CRITICAL + FUNC_CRITICAL))
+    TOTAL_HIGH=$((TOTAL_HIGH + FUNC_HIGH))
+    TOTAL_MODERATE=$((TOTAL_MODERATE + FUNC_MODERATE))
+    TOTAL_LOW=$((TOTAL_LOW + FUNC_LOW))
+    TOTAL_INFO=$((TOTAL_INFO + FUNC_INFO))
+done
+
+log_success "Aggregation complete"
+
+# Step 5: Remove downloaded zips and unzipped directories
+log_section "Cleanup"
+log_info "Removing zip files and unzipped directories..."
+
+for ZIP_FILE in *.zip; do
+    [[ -f "$ZIP_FILE" ]] && rm -f "$ZIP_FILE"
+done
+
+for DIR in */; do
+    [[ -d "$DIR" ]] && rm -rf "$DIR"
+done
+
+log_success "Cleanup complete"
+
+# Show final results
+echo
+log_section "Audit Results Summary"
+
+# Calculate grand total
+GRAND_TOTAL=$((TOTAL_CRITICAL + TOTAL_HIGH + TOTAL_MODERATE + TOTAL_LOW + TOTAL_INFO))
+
+# Display overall summary
+echo -e "${BOLD}Overall Vulnerability Summary:${RESET}"
+echo
+printf "  %-15s %8s\n" "Severity" "Count"
+printf "  %s\n" "$(printf '%.0s─' {1..25})"
+[[ $TOTAL_CRITICAL -gt 0 ]] && printf "  ${RED}%-15s${RESET} %8d\n" "Critical" "$TOTAL_CRITICAL" || printf "  %-15s %8d\n" "Critical" "$TOTAL_CRITICAL"
+[[ $TOTAL_HIGH -gt 0 ]] && printf "  ${YELLOW}%-15s${RESET} %8d\n" "High" "$TOTAL_HIGH" || printf "  %-15s %8d\n" "High" "$TOTAL_HIGH"
+[[ $TOTAL_MODERATE -gt 0 ]] && printf "  ${CYAN}%-15s${RESET} %8d\n" "Moderate" "$TOTAL_MODERATE" || printf "  %-15s %8d\n" "Moderate" "$TOTAL_MODERATE"
+printf "  %-15s %8d\n" "Low" "$TOTAL_LOW"
+printf "  %-15s %8d\n" "Info" "$TOTAL_INFO"
+printf "  %s\n" "$(printf '%.0s─' {1..25})"
+printf "  ${BOLD}%-15s %8d${RESET}\n" "TOTAL" "$GRAND_TOTAL"
+
+echo
+echo
+
+# Display per-function breakdown
+if [[ ${#FUNCTION_NAMES[@]} -gt 0 ]]; then
+    echo -e "${BOLD}Vulnerabilities by Lambda Function:${RESET}"
+    echo
+    printf "  %-40s %10s %10s %10s %10s %10s %10s\n" "Function Name" "Critical" "High" "Moderate" "Low" "Info" "Total"
+    printf "  %s\n" "$(printf '%.0s─' {1..100})"
+    
+    # Sort function names by total vulnerabilities (highest first)
+    for FUNC_NAME in $(for name in "${FUNCTION_NAMES[@]}"; do
+        IFS='|' read -r crit high mod low info <<< "${FUNCTION_RESULTS[$name]}"
+        total=$((crit + high + mod + low + info))
+        echo "$total|$name"
+    done | sort -rn | cut -d'|' -f2); do
+        
+        IFS='|' read -r CRIT HIGH MOD LOW INFO <<< "${FUNCTION_RESULTS[$FUNC_NAME]}"
+        FUNC_TOTAL=$((CRIT + HIGH + MOD + LOW + INFO))
+        
+        # Truncate long function names
+        DISPLAY_NAME="$FUNC_NAME"
+        if [[ ${#DISPLAY_NAME} -gt 38 ]]; then
+            DISPLAY_NAME="${DISPLAY_NAME:0:35}..."
+        fi
+        
+        # Color code the row if it has critical or high vulnerabilities
+        if [[ $CRIT -gt 0 ]]; then
+            printf "  ${RED}%-40s %10d %10d %10d %10d %10d %10d${RESET}\n" "$DISPLAY_NAME" "$CRIT" "$HIGH" "$MOD" "$LOW" "$INFO" "$FUNC_TOTAL"
+        elif [[ $HIGH -gt 0 ]]; then
+            printf "  ${YELLOW}%-40s %10d %10d %10d %10d %10d %10d${RESET}\n" "$DISPLAY_NAME" "$CRIT" "$HIGH" "$MOD" "$LOW" "$INFO" "$FUNC_TOTAL"
+        else
+            printf "  %-40s %10d %10d %10d %10d %10d %10d\n" "$DISPLAY_NAME" "$CRIT" "$HIGH" "$MOD" "$LOW" "$INFO" "$FUNC_TOTAL"
+        fi
+    done
+    
+    printf "  %s\n" "$(printf '%.0s─' {1..100})"
+    printf "  ${BOLD}%-40s %10d %10d %10d %10d %10d %10d${RESET}\n" "TOTAL" "$TOTAL_CRITICAL" "$TOTAL_HIGH" "$TOTAL_MODERATE" "$TOTAL_LOW" "$TOTAL_INFO" "$GRAND_TOTAL"
+fi
+
+echo
+echo
+
+# Show result files location
+RESULT_FILES=$(ls *-auditResults.json 2>/dev/null || true)
+
+if [[ -z "$RESULT_FILES" ]]; then
+    log_error "No audit result files found"
+else
+    RESULT_COUNT=$(echo "$RESULT_FILES" | wc -l | tr -d ' ')
+    log_success "Generated $RESULT_COUNT audit result file(s) in: $(pwd)"
+    
     if [[ $GRAND_TOTAL -eq 0 ]]; then
         echo
-        log_success "No vulnerabilities detected! 🎉"
-    else
-        echo -e "  ${BOLD}Total: $GRAND_TOTAL${RESET}"
-    fi
-
-    # Detailed breakdown
-    if [[ ${#AUDIT_RESULTS[@]} -gt 0 ]] && [[ $GRAND_TOTAL -gt 0 ]]; then
+        log_success "🎉 No vulnerabilities detected across all Lambda functions!"
+    elif [[ $TOTAL_CRITICAL -gt 0 ]] || [[ $TOTAL_HIGH -gt 0 ]]; then
         echo
-        echo -e "${BOLD}Detailed Breakdown:${RESET}"
-        printf "  %-10s %-50s %8s %8s %8s %8s %8s\n" "Type" "Name" "Critical" "High" "Medium" "Low" "Total"
-        printf "  %s\n" "$(printf '%.0s─' {1..120})"
-
-        for result in "${AUDIT_RESULTS[@]}"; do
-            IFS='|' read -r type name critical high medium low total <<< "$result"
-            if [[ $total -gt 0 ]]; then
-                # Truncate long names
-                local display_name="${name:0:47}"
-                [[ ${#name} -gt 47 ]] && display_name="${display_name}..."
-                printf "  %-10s %-50s %8s %8s %8s %8s %8s\n" "$type" "$display_name" "$critical" "$high" "$medium" "$low" "$total"
-            fi
-        done
+        log_error "⚠️  Critical or High severity vulnerabilities detected!"
+        log_info "Review the audit result files for detailed information"
     fi
+fi
 
-    # Exit code based on severity
-    if [[ $TOTAL_CRITICAL -gt 0 ]] || [[ $TOTAL_HIGH -gt 0 ]]; then
-        echo
-        log_warning "High or Critical vulnerabilities detected!"
-        return 1
-    fi
-
-    return 0
-}
-
-# ====== Export to JSON ======
-export_json() {
-    if [[ -z "$OUTPUT_JSON" ]]; then
-        return
-    fi
-
-    log_info "Exporting results to: $OUTPUT_JSON"
-
-    local JSON_CONTENT=$(cat <<EOF
-{
-  "scan_date": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
-  "aws_account": "$(aws sts get-caller-identity $([[ -n "$PROFILE" ]] && echo "--profile $PROFILE") --query 'Account' --output text 2>/dev/null || echo "unknown")",
-  "aws_region": "${REGION:-$(aws configure get region $([[ -n "$PROFILE" ]] && echo "--profile $PROFILE") 2>/dev/null || echo "us-east-1")}",
-  "summary": {
-    "total_functions": $PYTHON_COUNT,
-    "total_layers": $LAYER_COUNT,
-    "vulnerabilities": {
-      "critical": $TOTAL_CRITICAL,
-      "high": $TOTAL_HIGH,
-      "medium": $TOTAL_MEDIUM,
-      "low": $TOTAL_LOW,
-      "total": $((TOTAL_CRITICAL + TOTAL_HIGH + TOTAL_MEDIUM + TOTAL_LOW))
-    }
-  },
-  "results": [
-EOF
-)
-
-    local first=true
-    for result in "${AUDIT_RESULTS[@]}"; do
-        IFS='|' read -r type name critical high medium low total <<< "$result"
-        
-        [[ "$first" == true ]] && first=false || JSON_CONTENT="$JSON_CONTENT,"
-        
-        JSON_CONTENT="$JSON_CONTENT
-    {
-      \"type\": \"$type\",
-      \"name\": \"$name\",
-      \"vulnerabilities\": {
-        \"critical\": $critical,
-        \"high\": $high,
-        \"medium\": $medium,
-        \"low\": $low,
-        \"total\": $total
-      }
-    }"
-    done
-
-    JSON_CONTENT="$JSON_CONTENT
-  ]
-}"
-
-    echo "$JSON_CONTENT" > "$OUTPUT_JSON"
-    log_success "Results exported to $OUTPUT_JSON"
-}
-
-# ====== Cleanup ======
-cleanup() {
-    if [[ -d "$TMP_DIR" ]]; then
-        log_verbose "Cleaning up temporary directory: $TMP_DIR"
-        rm -rf "$TMP_DIR"
-    fi
-}
-
-# ====== Main ======
-main() {
-    # Trap cleanup on exit
-    trap cleanup EXIT
-
-    init "$@"
-    process_functions
-    process_layers
-    
-    echo
-    generate_report
-    local EXIT_CODE=$?
-    
-    export_json
-    
-    echo
-    log_section "Audit Complete"
-    
-    exit $EXIT_CODE
-}
-
-main "$@"
+echo
+log_info "All audit results saved in: $(pwd)"
