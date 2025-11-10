@@ -5,13 +5,13 @@
 #   Audits an AWS Security Group (SG) and lists all associated resources.
 #   Outputs:
 #     - SG info: Name, Description, VPC
-#     - Inbound and outbound rules (nicely formatted)
+#     - Inbound and outbound rules
 #     - EC2 instances using the SG
-#     - Network Interfaces (ENIs) using the SG with subnet/VPC/AZ and actual resource
-#     - Elastic Load Balancers (ALB/NLB) using the SG
-#     - RDS instances using the SG
+#     - Network Interfaces (ENIs) with subnet/VPC/AZ and full resource ARNs/names
+#     - Elastic Load Balancers (ALB/NLB)
+#     - RDS instances
 #     - ECS Tasks using the SG
-#     - EKS Node ENIs using the SG
+#     - EKS Node ENIs
 #
 # Requirements:
 #   - AWS CLI v2
@@ -128,33 +128,27 @@ echo "---------------------------------------------------------"
 # EC2 Instances
 # -----------------------------
 echo -e "${YELLOW}EC2 Instances using this SG:${NC}"
-printf "%-15s %-15s %-30s\n" "InstanceId" "PrivateIP" "Tags"
-echo "---------------------------------------------------------------"
+printf "%-20s %-20s %-40s\n" "InstanceId" "PrivateIP" "Tags"
+echo "----------------------------------------------------------------------------"
 aws ec2 describe-instances \
     --profile "$AWS_PROFILE" \
     --filters "Name=instance.group-id,Values=$SG_ID" \
     --query "Reservations[*].Instances[*].[InstanceId,PrivateIpAddress,Tags]" \
     --output text | column -t
-echo "---------------------------------------------------------------"
+echo "----------------------------------------------------------------------------"
 
 # -----------------------------
-# ENIs + Resource Mapping
+# ENIs + Resource Mapping (Full ARN, wider table)
 # -----------------------------
 echo -e "${YELLOW}ENIs using this SG:${NC}"
-printf "%-20s | %-15s | %-15s | %-12s | %-12s | %-10s | %-30s\n" "ENI_ID" "InstanceId" "PrivateIP" "SubnetId" "VPC_ID" "AZ" "Resource"
-echo "----------------------------------------------------------------------------------------------------------------------------"
+printf "%-20s | %-20s | %-20s | %-18s | %-18s | %-18s | %-160s\n" "ENI_ID" "InstanceId" "PrivateIP" "SubnetId" "VPC_ID" "AZ" "Resource"
+echo "--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------"
 ENIS=$(aws ec2 describe-network-interfaces --profile "$AWS_PROFILE" \
        --filters "Name=group-id,Values=$SG_ID" \
        --query "NetworkInterfaces[*].[NetworkInterfaceId,Attachment.InstanceId,PrivateIpAddress,SubnetId,VpcId,AvailabilityZone,InterfaceType]" \
        --output text)
 
 while read -r ENI_ID INSTANCE_ID PRIVATE_IP SUBNET_ID VPC_ID AZ IF_TYPE; do
-    ENI_TRUNC=$(echo "$ENI_ID" | cut -c1-17)
-    INSTANCE_TRUNC=$(echo "$INSTANCE_ID" | cut -c1-12)
-    SUBNET_TRUNC=$(echo "$SUBNET_ID" | cut -c1-12)
-    VPC_TRUNC=$(echo "$VPC_ID" | cut -c1-12)
-    AZ_TRUNC=$(echo "$AZ" | cut -c1-10)
-
     RESOURCE="Unknown"
     case "$IF_TYPE" in
         "interface")
@@ -167,7 +161,7 @@ while read -r ENI_ID INSTANCE_ID PRIVATE_IP SUBNET_ID VPC_ID AZ IF_TYPE; do
                 --query "Functions[?VpcConfig.SecurityGroupIds && contains(VpcConfig.SecurityGroupIds,'$SG_ID')].[FunctionArn]" \
                 --output text)
             if [[ -n "$LAMBDAS" ]]; then
-                RESOURCE=$(echo "$LAMBDAS" | cut -c1-30)
+                RESOURCE="$LAMBDAS"
             else
                 RESOURCE="Lambda"
             fi
@@ -176,7 +170,7 @@ while read -r ENI_ID INSTANCE_ID PRIVATE_IP SUBNET_ID VPC_ID AZ IF_TYPE; do
             LBS=$(aws elbv2 describe-load-balancers --profile "$AWS_PROFILE" \
                 --query "LoadBalancers[?contains(SecurityGroups,'$SG_ID')].[LoadBalancerName]" --output text)
             if [[ -n "$LBS" ]]; then
-                RESOURCE=$(echo "$LBS" | cut -c1-30)
+                RESOURCE="$LBS"
             else
                 RESOURCE="ELB/ALB/NLB"
             fi
@@ -186,7 +180,7 @@ while read -r ENI_ID INSTANCE_ID PRIVATE_IP SUBNET_ID VPC_ID AZ IF_TYPE; do
                 --query "DBInstances[?VpcSecurityGroups[?VpcSecurityGroupId=='$SG_ID']].[DBInstanceIdentifier]" \
                 --output text)
             if [[ -n "$RDS" ]]; then
-                RESOURCE=$(echo "$RDS" | cut -c1-30)
+                RESOURCE="$RDS"
             else
                 RESOURCE="RDS"
             fi
@@ -194,18 +188,18 @@ while read -r ENI_ID INSTANCE_ID PRIVATE_IP SUBNET_ID VPC_ID AZ IF_TYPE; do
         *) RESOURCE="Other" ;;
     esac
 
-    printf "%-20s | %-15s | %-15s | %-12s | %-12s | %-10s | %-30s\n" \
-        "$ENI_TRUNC" "$INSTANCE_TRUNC" "$PRIVATE_IP" "$SUBNET_TRUNC" "$VPC_TRUNC" "$AZ_TRUNC" "$RESOURCE"
+    printf "%-20s | %-20s | %-20s | %-18s | %-18s | %-18s | %-160s\n" \
+        "$ENI_ID" "$INSTANCE_ID" "$PRIVATE_IP" "$SUBNET_ID" "$VPC_ID" "$AZ" "$RESOURCE"
 
 done <<< "$ENIS"
-echo "----------------------------------------------------------------------------------------------------------------------------"
+echo "--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------"
 
 # -----------------------------
 # ECS Tasks
 # -----------------------------
 echo -e "${YELLOW}ECS Tasks using this SG:${NC}"
-printf "%-35s %-30s %-15s %-15s\n" "Cluster" "TaskARN" "ENI_ID" "PrivateIP"
-echo "----------------------------------------------------------------------------------------------"
+printf "%-35s %-60s %-20s %-20s\n" "Cluster" "TaskARN" "ENI_ID" "PrivateIP"
+echo "-------------------------------------------------------------------------------------------------------------------------------"
 CLUSTERS=$(aws ecs list-clusters --profile "$AWS_PROFILE" --query "clusterArns[]" --output text)
 for CLUSTER in $CLUSTERS; do
     TASKS=$(aws ecs list-tasks --cluster "$CLUSTER" --profile "$AWS_PROFILE" --query "taskArns[]" --output text)
@@ -223,14 +217,14 @@ for CLUSTER in $CLUSTERS; do
         done
     fi
 done
-echo "----------------------------------------------------------------------------------------------"
+echo "-------------------------------------------------------------------------------------------------------------------------------"
 
 # -----------------------------
 # EKS Node ENIs
 # -----------------------------
 echo -e "${YELLOW}EKS Node ENIs using this SG:${NC}"
-printf "%-20s %-20s %-15s %-15s %-15s %-15s\n" "ENI_ID" "InstanceId" "PrivateIP" "SubnetId" "VPC_ID" "AZ"
-echo "---------------------------------------------------------------------------------------------"
+printf "%-20s %-20s %-20s %-18s %-18s %-18s\n" "ENI_ID" "InstanceId" "PrivateIP" "SubnetId" "VPC_ID" "AZ"
+echo "-------------------------------------------------------------------------------------------------------------------------------"
 EKS_INSTANCES=$(aws ec2 describe-instances --profile "$AWS_PROFILE" \
     --filters "Name=tag:eks:cluster-name,Values=*" "Name=instance-state-name,Values=running" \
     --query "Reservations[*].Instances[*].InstanceId" --output text)
@@ -240,31 +234,31 @@ for INSTANCE in $EKS_INSTANCES; do
         --query "NetworkInterfaces[*].[NetworkInterfaceId,Attachment.InstanceId,PrivateIpAddress,SubnetId,VpcId,AvailabilityZone]" \
         --output text | column -t
 done
-echo "---------------------------------------------------------------------------------------------"
+echo "-------------------------------------------------------------------------------------------------------------------------------"
 
 # -----------------------------
 # ALB/NLB Load Balancers
 # -----------------------------
 echo -e "${YELLOW}Elastic Load Balancers (v2) using this SG:${NC}"
-printf "%-25s %-40s %-15s\n" "LoadBalancerName" "DNSName" "VPC_ID"
-echo "--------------------------------------------------------------------------"
+printf "%-25s %-60s %-20s\n" "LoadBalancerName" "DNSName" "VPC_ID"
+echo "-------------------------------------------------------------------------------------------------------------------------------"
 aws elbv2 describe-load-balancers \
     --profile "$AWS_PROFILE" \
     --query "LoadBalancers[?SecurityGroups && contains(SecurityGroups,'$SG_ID')].[LoadBalancerName,DNSName,VpcId]" \
     --output text | column -t
-echo "--------------------------------------------------------------------------"
+echo "-------------------------------------------------------------------------------------------------------------------------------"
 
 # -----------------------------
 # RDS Instances
 # -----------------------------
 echo -e "${YELLOW}RDS Instances using this SG:${NC}"
-printf "%-25s %-15s %-30s\n" "DBInstanceIdentifier" "Status" "Endpoint"
-echo "--------------------------------------------------------------------------"
+printf "%-25s %-15s %-40s\n" "DBInstanceIdentifier" "Status" "Endpoint"
+echo "-------------------------------------------------------------------------------------------------------------------------------"
 aws rds describe-db-instances \
     --profile "$AWS_PROFILE" \
     --query "DBInstances[?VpcSecurityGroups[?VpcSecurityGroupId=='$SG_ID']].[DBInstanceIdentifier,DBInstanceStatus,Endpoint.Address]" \
     --output text | column -t
-echo "--------------------------------------------------------------------------"
+echo "-------------------------------------------------------------------------------------------------------------------------------"
 
 echo "-----------------------------------------"
 echo -e "${CYAN}Done.${NC}"
