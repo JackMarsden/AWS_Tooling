@@ -7,7 +7,7 @@
 #     - SG name, description, VPC
 #     - Inbound and outbound rules (nicely formatted tables)
 #     - EC2 instances using the SG
-#     - Network Interfaces (ENIs) using the SG with subnet/VPC/AZ
+#     - Network Interfaces (ENIs) using the SG with subnet/VPC/AZ and attached resource
 #     - Elastic Load Balancers (ALB/NLB) using the SG
 #     - RDS instances using the SG
 #     - ECS Tasks using the SG
@@ -150,41 +150,35 @@ aws ec2 describe-instances \
 echo "---------------------------------------------------------------"
 
 # -----------------------------
-# Network Interfaces (ENIs)
+# ENIs + Attached Resource Mapping
 # -----------------------------
-echo -e "${YELLOW}Network Interfaces (ENIs) using this SG:${NC}"
-printf "%-20s %-15s %-15s %-15s %-15s %-15s\n" "ENI_ID" "InstanceId" "PrivateIP" "SubnetId" "VPC_ID" "AvailabilityZone"
-echo "---------------------------------------------------------------------------------------------"
-aws ec2 describe-network-interfaces \
-    --profile "$AWS_PROFILE" \
-    --filters "Name=group-id,Values=$SG_ID" \
-    --query "NetworkInterfaces[*].[NetworkInterfaceId,Attachment.InstanceId,PrivateIpAddress,SubnetId,VpcId,AvailabilityZone]" \
-    --output text | column -t
-echo "---------------------------------------------------------------------------------------------"
-
-# -----------------------------
-# Load Balancers (ALB/NLB)
-# -----------------------------
-echo -e "${YELLOW}Elastic Load Balancers (v2) using this SG:${NC}"
-printf "%-25s %-40s %-15s\n" "LoadBalancerName" "DNSName" "VPC_ID"
-echo "--------------------------------------------------------------------------"
-aws elbv2 describe-load-balancers \
-    --profile "$AWS_PROFILE" \
-    --query "LoadBalancers[?SecurityGroups[?contains(@,'$SG_ID')]].[LoadBalancerName,DNSName,VpcId]" \
-    --output text | column -t
-echo "--------------------------------------------------------------------------"
-
-# -----------------------------
-# RDS Instances
-# -----------------------------
-echo -e "${YELLOW}RDS Instances using this SG:${NC}"
-printf "%-25s %-15s %-30s\n" "DBInstanceIdentifier" "Status" "Endpoint"
-echo "--------------------------------------------------------------------------"
-aws rds describe-db-instances \
-    --profile "$AWS_PROFILE" \
-    --query "DBInstances[?VpcSecurityGroups[?VpcSecurityGroupId=='$SG_ID']].[DBInstanceIdentifier,DBInstanceStatus,Endpoint.Address]" \
-    --output text | column -t
-echo "--------------------------------------------------------------------------"
+echo -e "${YELLOW}ENIs using this SG and their resources:${NC}"
+printf "%-20s %-15s %-15s %-15s %-15s %-15s %-20s\n" "ENI_ID" "InstanceId" "PrivateIP" "SubnetId" "VPC_ID" "AZ" "ResourceType"
+echo "---------------------------------------------------------------------------------------------------------------"
+ENIS=$(aws ec2 describe-network-interfaces --profile "$AWS_PROFILE" --filters "Name=group-id,Values=$SG_ID" \
+       --query "NetworkInterfaces[*].[NetworkInterfaceId,Attachment.InstanceId,PrivateIpAddress,SubnetId,VpcId,AvailabilityZone]" --output text)
+while read -r ENI_ID INSTANCE_ID PRIVATE_IP SUBNET_ID VPC_ID AZ; do
+    RESOURCE="Unknown"
+    if [[ "$INSTANCE_ID" != "None" && "$INSTANCE_ID" != "-" ]]; then
+        RESOURCE="EC2 Instance"
+    else
+        # Check RDS
+        RDS=$(aws rds describe-db-instances --profile "$AWS_PROFILE" \
+            --query "DBInstances[?VpcSecurityGroups[?VpcSecurityGroupId=='$SG_ID']].[DBInstanceIdentifier]" --output text)
+        if [[ -n "$RDS" ]]; then
+            RESOURCE="RDS"
+        fi
+        # Check ELB
+        ELB=$(aws elbv2 describe-load-balancers --profile "$AWS_PROFILE" \
+            --query "LoadBalancers[?contains(SecurityGroups,'$SG_ID')].[LoadBalancerName]" --output text)
+        if [[ -n "$ELB" ]]; then
+            RESOURCE="ELB"
+        fi
+        # ECS ENI check handled separately
+    fi
+    echo -e "$ENI_ID\t$INSTANCE_ID\t$PRIVATE_IP\t$SUBNET_ID\t$VPC_ID\t$AZ\t$RESOURCE" | column -t
+done <<< "$ENIS"
+echo "---------------------------------------------------------------------------------------------------------------"
 
 # -----------------------------
 # ECS Tasks
@@ -200,7 +194,6 @@ for CLUSTER in $CLUSTERS; do
             ENIS=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$TASK" --profile "$AWS_PROFILE" \
                 --query "tasks[].attachments[].details[?name=='networkInterfaceId'].value" --output text)
             for ENI in $ENIS; do
-                # check if ENI has the SG
                 SG_CHECK=$(aws ec2 describe-network-interfaces --network-interface-ids "$ENI" --profile "$AWS_PROFILE" \
                     --query "NetworkInterfaces[?contains(Groups[].GroupId,'$SG_ID')].[NetworkInterfaceId,PrivateIpAddress]" --output text)
                 if [[ -n "$SG_CHECK" ]]; then
@@ -216,9 +209,8 @@ echo "--------------------------------------------------------------------------
 # EKS Node ENIs
 # -----------------------------
 echo -e "${YELLOW}EKS Node ENIs using this SG:${NC}"
-printf "%-20s %-20s %-15s %-15s %-15s %-15s\n" "ENI_ID" "InstanceId" "PrivateIP" "SubnetId" "VPC_ID" "AvailabilityZone"
+printf "%-20s %-20s %-15s %-15s %-15s %-15s\n" "ENI_ID" "InstanceId" "PrivateIP" "SubnetId" "VPC_ID" "AZ"
 echo "---------------------------------------------------------------------------------------------"
-# Get EKS worker nodes by tag
 EKS_INSTANCES=$(aws ec2 describe-instances --profile "$AWS_PROFILE" \
     --filters "Name=tag:eks:cluster-name,Values=*" "Name=instance-state-name,Values=running" \
     --query "Reservations[*].Instances[*].InstanceId" --output text)
