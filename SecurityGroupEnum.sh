@@ -1,8 +1,8 @@
 #!/bin/bash
-# sg-resource-check.sh
-# Comprehensive AWS Security Group audit tool
+# SecurityGroupEnum.sh
+# Comprehensive AWS Security Group enumeration and audit tool
 # 
-# Usage: ./sg-resource-check.sh --profile <aws-profile> --group <sg-id> [--region <region>]
+# Usage: ./SecurityGroupEnum.sh --profile <aws-profile> --group <sg-id> [--region <region>]
 
 set -euo pipefail
 
@@ -1049,7 +1049,7 @@ main() {
     done
     
     echo -e "${YELLOW}${BOLD}═══════════════════════════════════════════════════════════${NC}"
-    echo -e "${YELLOW}${BOLD}         AWS Security Group Audit Tool${NC}"
+    echo -e "${YELLOW}${BOLD}     AWS Security Group Enumeration Tool${NC}"
     echo -e "${YELLOW}${BOLD}═══════════════════════════════════════════════════════════${NC}"
     echo -e "${CYAN}Profile: ${BOLD}$AWS_PROFILE${NC} | ${CYAN}Region: ${BOLD}$REGION${NC}"
     print_separator
