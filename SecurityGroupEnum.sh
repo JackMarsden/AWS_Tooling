@@ -10,6 +10,8 @@
 #     - Network Interfaces (ENIs) using the SG with subnet/VPC/AZ
 #     - Elastic Load Balancers (ALB/NLB) using the SG
 #     - RDS instances using the SG
+#     - ECS Tasks using the SG
+#     - EKS Node ENIs using the SG
 #
 # Requirements:
 #   - AWS CLI v2 installed and configured
@@ -19,6 +21,7 @@
 #       - EC2 Instances and Network Interfaces
 #       - ELBv2 Load Balancers
 #       - RDS instances
+#       - ECS clusters and tasks
 #
 # Flags:
 #   --profile <aws-profile>   : (Required) AWS CLI profile to use
@@ -27,11 +30,6 @@
 # Usage:
 #   chmod +x sg-resource-check.sh
 #   ./sg-resource-check.sh --profile my-aws-profile --group sg-0123456789abcdef
-#
-# Notes:
-#   - This script only queries configuration; it does NOT inspect traffic or logs.
-#   - To see actual traffic using this SG, enable VPC Flow Logs.
-#   - Works for resources in the region configured by the AWS CLI profile.
 
 set -e
 
@@ -41,7 +39,7 @@ set -e
 RED="\033[1;31m"
 YELLOW="\033[1;33m"
 CYAN="\033[1;36m"
-NC="\033[0m" # No Color
+NC="\033[0m"
 
 # -----------------------------
 # Parse arguments
@@ -187,6 +185,50 @@ aws rds describe-db-instances \
     --query "DBInstances[?VpcSecurityGroups[?VpcSecurityGroupId=='$SG_ID']].[DBInstanceIdentifier,DBInstanceStatus,Endpoint.Address]" \
     --output text | column -t
 echo "--------------------------------------------------------------------------"
+
+# -----------------------------
+# ECS Tasks
+# -----------------------------
+echo -e "${YELLOW}ECS Tasks using this SG:${NC}"
+printf "%-35s %-30s %-15s %-15s\n" "Cluster" "TaskARN" "ENI_ID" "PrivateIP"
+echo "----------------------------------------------------------------------------------------------"
+CLUSTERS=$(aws ecs list-clusters --profile "$AWS_PROFILE" --query "clusterArns[]" --output text)
+for CLUSTER in $CLUSTERS; do
+    TASKS=$(aws ecs list-tasks --cluster "$CLUSTER" --profile "$AWS_PROFILE" --query "taskArns[]" --output text)
+    if [[ -n "$TASKS" ]]; then
+        for TASK in $TASKS; do
+            ENIS=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$TASK" --profile "$AWS_PROFILE" \
+                --query "tasks[].attachments[].details[?name=='networkInterfaceId'].value" --output text)
+            for ENI in $ENIS; do
+                # check if ENI has the SG
+                SG_CHECK=$(aws ec2 describe-network-interfaces --network-interface-ids "$ENI" --profile "$AWS_PROFILE" \
+                    --query "NetworkInterfaces[?contains(Groups[].GroupId,'$SG_ID')].[NetworkInterfaceId,PrivateIpAddress]" --output text)
+                if [[ -n "$SG_CHECK" ]]; then
+                    echo -e "$CLUSTER\t$TASK\t$SG_CHECK" | column -t
+                fi
+            done
+        done
+    fi
+done
+echo "----------------------------------------------------------------------------------------------"
+
+# -----------------------------
+# EKS Node ENIs
+# -----------------------------
+echo -e "${YELLOW}EKS Node ENIs using this SG:${NC}"
+printf "%-20s %-20s %-15s %-15s %-15s %-15s\n" "ENI_ID" "InstanceId" "PrivateIP" "SubnetId" "VPC_ID" "AvailabilityZone"
+echo "---------------------------------------------------------------------------------------------"
+# Get EKS worker nodes by tag
+EKS_INSTANCES=$(aws ec2 describe-instances --profile "$AWS_PROFILE" \
+    --filters "Name=tag:eks:cluster-name,Values=*" "Name=instance-state-name,Values=running" \
+    --query "Reservations[*].Instances[*].InstanceId" --output text)
+for INSTANCE in $EKS_INSTANCES; do
+    aws ec2 describe-network-interfaces --profile "$AWS_PROFILE" \
+        --filters "Name=attachment.instance-id,Values=$INSTANCE" "Name=group-id,Values=$SG_ID" \
+        --query "NetworkInterfaces[*].[NetworkInterfaceId,Attachment.InstanceId,PrivateIpAddress,SubnetId,VpcId,AvailabilityZone]" \
+        --output text | column -t
+done
+echo "---------------------------------------------------------------------------------------------"
 
 echo "-----------------------------------------"
 echo -e "${CYAN}Done.${NC}"
