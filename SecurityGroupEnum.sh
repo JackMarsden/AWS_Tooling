@@ -28,15 +28,6 @@
 #   chmod +x sg-resource-check.sh
 #   ./sg-resource-check.sh --profile my-aws-profile --group sg-0123456789abcdef
 #
-# Output:
-#   - Header with SG name, description, VPC
-#   - Inbound rules table
-#   - Outbound rules table
-#   - EC2 instances table
-#   - ENIs table
-#   - ELBv2 table
-#   - RDS table
-#
 # Notes:
 #   - This script only queries configuration; it does NOT inspect traffic or logs.
 #   - To see actual traffic using this SG, enable VPC Flow Logs.
@@ -45,23 +36,31 @@
 set -e
 
 # -----------------------------
+# Color Codes
+# -----------------------------
+RED="\033[1;31m"
+YELLOW="\033[1;33m"
+CYAN="\033[1;36m"
+NC="\033[0m" # No Color
+
+# -----------------------------
 # Parse arguments
 # -----------------------------
 while [[ "$#" -gt 0 ]]; do
     case $1 in
         --profile) AWS_PROFILE="$2"; shift ;;
         --group) SG_ID="$2"; shift ;;
-        *) echo "Unknown parameter passed: $1"; exit 1 ;;
+        *) echo -e "${RED}Unknown parameter passed: $1${NC}"; exit 1 ;;
     esac
     shift
 done
 
 if [[ -z "$AWS_PROFILE" || -z "$SG_ID" ]]; then
-    echo "Usage: $0 --profile <aws-profile> --group <sg-id>"
+    echo -e "${RED}Usage: $0 --profile <aws-profile> --group <sg-id>${NC}"
     exit 1
 fi
 
-echo "Checking security group: $SG_ID (profile: $AWS_PROFILE)"
+echo -e "${YELLOW}Checking security group: $SG_ID (profile: $AWS_PROFILE)${NC}"
 echo "-----------------------------------------"
 
 # -----------------------------
@@ -74,7 +73,7 @@ SG_JSON=$(aws ec2 describe-security-groups \
     --output json 2>/dev/null || echo "")
 
 if [[ -z "$SG_JSON" ]]; then
-    echo "Error: Security group $SG_ID does not exist in profile $AWS_PROFILE."
+    echo -e "${RED}Error: Security group $SG_ID does not exist in profile $AWS_PROFILE.${NC}"
     exit 1
 fi
 
@@ -85,16 +84,16 @@ SG_NAME=$(echo "$SG_JSON" | jq -r '.GroupName')
 SG_DESC=$(echo "$SG_JSON" | jq -r '.Description')
 VPC_ID=$(echo "$SG_JSON" | jq -r '.VpcId')
 
-echo "Security Group: $SG_ID"
-echo "Name: $SG_NAME"
-echo "Description: $SG_DESC"
-echo "VPC ID: $VPC_ID"
+echo -e "${CYAN}Security Group: $SG_ID${NC}"
+echo -e "${CYAN}Name: $SG_NAME${NC}"
+echo -e "${CYAN}Description: $SG_DESC${NC}"
+echo -e "${CYAN}VPC ID: $VPC_ID${NC}"
 echo "-----------------------------------------"
 
 # -----------------------------
 # Format and display inbound rules
 # -----------------------------
-echo "Inbound Rules:"
+echo -e "${YELLOW}Inbound Rules:${NC}"
 printf "%-8s %-8s %-8s %-25s\n" "Protocol" "FromPort" "ToPort" "Source"
 echo "---------------------------------------------------------"
 echo "$SG_JSON" | jq -r '
@@ -118,7 +117,7 @@ echo "---------------------------------------------------------"
 # -----------------------------
 # Format and display outbound rules
 # -----------------------------
-echo "Outbound Rules:"
+echo -e "${YELLOW}Outbound Rules:${NC}"
 printf "%-8s %-8s %-8s %-25s\n" "Protocol" "FromPort" "ToPort" "Destination"
 echo "---------------------------------------------------------"
 echo "$SG_JSON" | jq -r '
@@ -142,40 +141,52 @@ echo "---------------------------------------------------------"
 # -----------------------------
 # EC2 Instances
 # -----------------------------
-echo "EC2 Instances using this SG:"
+echo -e "${YELLOW}EC2 Instances using this SG:${NC}"
+printf "%-15s %-15s %-30s\n" "InstanceId" "PrivateIP" "Tags"
+echo "---------------------------------------------------------------"
 aws ec2 describe-instances \
     --profile "$AWS_PROFILE" \
     --filters "Name=instance.group-id,Values=$SG_ID" \
     --query "Reservations[*].Instances[*].[InstanceId,PrivateIpAddress,Tags]" \
-    --output table
+    --output text | column -t
+echo "---------------------------------------------------------------"
 
 # -----------------------------
 # Network Interfaces (ENIs)
 # -----------------------------
-echo "Network Interfaces (ENIs) using this SG:"
+echo -e "${YELLOW}Network Interfaces (ENIs) using this SG:${NC}"
+printf "%-20s %-15s %-15s %-15s %-15s %-15s\n" "ENI_ID" "InstanceId" "PrivateIP" "SubnetId" "VPC_ID" "AvailabilityZone"
+echo "---------------------------------------------------------------------------------------------"
 aws ec2 describe-network-interfaces \
     --profile "$AWS_PROFILE" \
     --filters "Name=group-id,Values=$SG_ID" \
     --query "NetworkInterfaces[*].[NetworkInterfaceId,Attachment.InstanceId,PrivateIpAddress,SubnetId,VpcId,AvailabilityZone]" \
-    --output table
+    --output text | column -t
+echo "---------------------------------------------------------------------------------------------"
 
 # -----------------------------
 # Load Balancers (ALB/NLB)
 # -----------------------------
-echo "Elastic Load Balancers (v2) using this SG:"
+echo -e "${YELLOW}Elastic Load Balancers (v2) using this SG:${NC}"
+printf "%-25s %-40s %-15s\n" "LoadBalancerName" "DNSName" "VPC_ID"
+echo "--------------------------------------------------------------------------"
 aws elbv2 describe-load-balancers \
     --profile "$AWS_PROFILE" \
     --query "LoadBalancers[?SecurityGroups[?contains(@,'$SG_ID')]].[LoadBalancerName,DNSName,VpcId]" \
-    --output table
+    --output text | column -t
+echo "--------------------------------------------------------------------------"
 
 # -----------------------------
 # RDS Instances
 # -----------------------------
-echo "RDS Instances using this SG:"
+echo -e "${YELLOW}RDS Instances using this SG:${NC}"
+printf "%-25s %-15s %-30s\n" "DBInstanceIdentifier" "Status" "Endpoint"
+echo "--------------------------------------------------------------------------"
 aws rds describe-db-instances \
     --profile "$AWS_PROFILE" \
     --query "DBInstances[?VpcSecurityGroups[?VpcSecurityGroupId=='$SG_ID']].[DBInstanceIdentifier,DBInstanceStatus,Endpoint.Address]" \
-    --output table
+    --output text | column -t
+echo "--------------------------------------------------------------------------"
 
 echo "-----------------------------------------"
-echo "Done."
+echo -e "${CYAN}Done.${NC}"
