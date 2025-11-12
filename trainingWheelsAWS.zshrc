@@ -1,7 +1,7 @@
 # === AWS CLI Training Wheels wrapper ===
 # Verifies caller identity before executing AWS CLI commands
 
-#Usage: Copy content into the end of ~/.zshrc
+#Usage: Copy content into the end of ~/.zshrc - (curl -fsSL 'https://github.com/JackMarsden/AWS_Tooling/raw/refs/heads/main/trainingWheelsAWS.zshrc' >> ~/.zshrc && unset -f aws && source ~/.zshrc)
 #kali: unset -f aws
 #kali: source ~/.zshrc
 AWS_REAL_BIN="$(whence -p aws 2>/dev/null || command -v aws 2>/dev/null || true)"
